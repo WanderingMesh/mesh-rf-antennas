@@ -1,0 +1,47 @@
+# =============================================================================
+# Longley-Rice RF Coverage Mapper - Docker Compose
+# =============================================================================
+# Quick start:
+#   docker-compose up --build
+#
+# Access at: http://localhost:8000
+# =============================================================================
+
+services:
+  rf-coverage:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: rf-coverage-mapper
+    ports:
+      - "8000:8000"
+    environment:
+      # Application configuration
+      - PYTHONUNBUFFERED=1
+      # Optional: Set admin key for cache management API
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-changeme}
+    volumes:
+      # Persist cached coverage calculations
+      - coverage_cache:/app/coverage_db
+      # Persist DEM cache (terrain data)
+      - dem_cache:/app/dem_cache
+      # Persist SPLAT! cache
+      - splat_cache:/app/splat_cache
+      # Logs
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  coverage_cache:
+    driver: local
+  dem_cache:
+    driver: local
+  splat_cache:
+    driver: local
+

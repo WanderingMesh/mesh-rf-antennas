@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  rf-coverage-app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - CONFIG_TYPE=production
+      - DEM_CACHE_DIR=/app/dem_cache
+      - OUTPUT_DIR=/app/output
+      - LOGS_DIR=/app/logs
+    volumes:
+      - ./dem_cache:/app/dem_cache
+      - ./output:/app/output
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - rf-coverage-app
+    restart: unless-stopped

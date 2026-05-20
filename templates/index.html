@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ed's Silly RF Coverage Web Application</title>
+    
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/style.css">
+    
+    <!-- Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1><i class="fas fa-satellite-dish"></i> Longley-Rice RF Coverage</h1>
+            <p>(It's SPLAT! On The Backend)</p>
+        </header>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Control Panel -->
+            <div class="control-panel">
+                <div class="panel-section">
+                    <h3><i class="fas fa-cog"></i> RF Parameters</h3>
+                    <div class="form-group">
+                        <label for="frequency">Frequency (MHz):</label>
+                        <input type="number" id="frequency" value="900" min="100" max="6000" step="0.1">
+                    </div>
+                    <div class="form-group">
+                        <label for="txPower">TX Power (dBm):</label>
+                        <input type="number" id="txPower" value="30" min="-50" max="50" step="0.1">
+                    </div>
+                    <div class="form-group">
+                        <label for="antennaType">Antenna Type:</label>
+                        <select id="antennaType">
+                            <option value="omnidirectional">Omnidirectional (Typical: 0 dBi)</option>
+                            <option value="yagi_3el">3-Element Yagi (Typical: 7 dBi, 60° BW)</option>
+                            <option value="yagi_5el">5-Element Yagi (Typical: 10 dBi, 40° BW)</option>
+                            <option value="yagi_11el">11-Element Yagi (Typical: 13 dBi, 30° BW)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="antennaGain">
+                            Antenna Gain (dBi):
+                            <span id="gainAutoFillIndicator" style="font-size: 0.85em; color: #666; font-weight: normal;"></span>
+                        </label>
+                        <input type="number" id="antennaGain" value="0" min="-20" max="30" step="0.1" title="Antenna gain in dBi (auto-filled from antenna type, but can be customized)">
+                        <small style="color: #666;">Auto-filled from antenna type, but you can override</small>
+                    </div>
+                    <div class="form-group" id="azimuthGroup" style="display: none;">
+                        <label for="antennaAzimuth">Antenna Azimuth (degrees):</label>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <input type="range" id="antennaAzimuth" value="0" min="0" max="360" step="1" style="flex: 1;">
+                            <input type="number" id="antennaAzimuthValue" value="0" min="0" max="360" step="1" style="width: 70px;">
+                            <span id="azimuthDirection" style="font-weight: bold; width: 40px;">N</span>
+                        </div>
+                        <div style="text-align: center; margin-top: 5px; font-size: 0.85em; color: #666;">
+                            <span>0°=North, 90°=East, 180°=South, 270°=West</span>
+                        </div>
+                    </div>
+                    <div class="form-group" id="tiltGroup">
+                        <label for="antennaTilt">Antenna Tilt (degrees):</label>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <input type="range" id="antennaTilt" value="0" min="-10" max="10" step="0.5" style="flex: 1;">
+                            <input type="number" id="antennaTiltValue" value="0" min="-10" max="10" step="0.5" style="width: 70px;">
+                        </div>
+                        <div style="text-align: center; margin-top: 5px; font-size: 0.85em; color: #666;">
+                            <span>Negative = up (above horizon), Positive = down (below horizon), 0 = level</span>
+                        </div>
+                    </div>
+                    <div class="form-group" id="tiltAzimuthGroup" style="display: none;">
+                        <label for="tiltAzimuth">Tilt Direction (degrees):</label>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <input type="range" id="tiltAzimuth" value="0" min="0" max="360" step="1" style="flex: 1;">
+                            <input type="number" id="tiltAzimuthValue" value="0" min="0" max="360" step="1" style="width: 70px;">
+                            <span id="tiltAzimuthDirection" style="font-weight: bold; width: 40px;">N</span>
+                        </div>
+                        <div style="text-align: center; margin-top: 5px; font-size: 0.85em; color: #666;">
+                            <span>Compass direction the antenna tilts toward</span>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="rxSensitivity">RX Sensitivity (dBm):</label>
+                        <input type="number" id="rxSensitivity" value="-100" min="-150" max="-50" step="0.1">
+                    </div>
+                    <div class="form-group">
+                        <label for="analysisRadius">Analysis Radius (km):</label>
+                        <input type="number" id="analysisRadius" value="50" min="1" max="200" step="1">
+                    </div>
+                    <div class="form-group">
+                        <label for="climateZone">Climate Zone:</label>
+                        <select id="climateZone">
+                            <option value="continental_temperate">Continental Temperate</option>
+                            <option value="maritime_temperate">Maritime Temperate</option>
+                            <option value="continental_subtropical">Continental Subtropical</option>
+                            <option value="maritime_subtropical">Maritime Subtropical</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <h3><i class="fas fa-map-marker-alt"></i> Single Site</h3>
+                    <div class="form-group">
+                        <label for="siteName">Site Name:</label>
+                        <input type="text" id="siteName" placeholder="Enter site name">
+                    </div>
+                    <div class="form-group">
+                        <label for="siteLat">Latitude:</label>
+                        <input type="number" id="siteLat" step="any" placeholder="39.5296">
+                    </div>
+                    <div class="form-group">
+                        <label for="siteLon">Longitude:</label>
+                        <input type="number" id="siteLon" step="any" placeholder="-119.8138">
+                    </div>
+                    <div class="form-group">
+                        <label for="siteElev">Antenna Height AGL (m):</label>
+                        <input type="number" id="siteElev" step="any" placeholder="3" title="Antenna height above ground level in meters">
+                    </div>
+                    <button id="calculateSingle" class="btn btn-primary">
+                        <i class="fas fa-calculator"></i> Calculate Single Site
+                    </button>
+                </div>
+
+                <div class="panel-section">
+                    <h3><i class="fas fa-network-wired"></i> Multi-Site</h3>
+                    <div class="form-group">
+                        <label for="sitesFile">Upload Sites CSV:</label>
+                        <input type="file" id="sitesFile" accept=".csv">
+                        <small>Format: name,lat,lon,elev</small>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="showNodes" checked>
+                            Show node locations
+                        </label>
+                    </div>
+                    <button id="calculateMulti" class="btn btn-success">
+                        <i class="fas fa-calculator"></i> Calculate Multi-Site
+                    </button>
+                </div>
+
+                <div class="panel-section">
+                    <h3><i class="fas fa-map"></i> Map Controls</h3>
+                    <button id="clearMap" class="btn btn-warning">
+                        <i class="fas fa-eraser"></i> Clear All Coverage
+                    </button>
+                </div>
+
+                <div class="panel-section">
+                    <h3><i class="fas fa-chart-bar"></i> Results</h3>
+                    <div id="resultsPanel" class="results-panel">
+                        <p>Click on the map to place a site, or upload a CSV file for multi-site analysis.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Map Container -->
+            <div class="map-container">
+                <div id="map"></div>
+                <div class="map-overlay">
+                    <div class="loading" id="loadingIndicator" style="display: none;">
+                        <i class="fas fa-spinner fa-spin"></i> Calculating coverage...
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-item">
+                <i class="fas fa-info-circle"></i>
+                <span id="statusText">Ready</span>
+            </div>
+            <div class="status-item">
+                <i class="fas fa-clock"></i>
+                <span id="lastUpdate">-</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Leaflet JavaScript -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <!-- Custom JavaScript -->
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

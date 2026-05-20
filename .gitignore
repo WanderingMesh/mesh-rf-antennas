@@ -1,0 +1,6 @@
+dem_cache/*
+splat_src/*
+*.md
+nevada_viewshed.db
+nevada_dem.tif
+

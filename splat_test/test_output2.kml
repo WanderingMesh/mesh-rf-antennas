@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://earth.google.com/kml/2.1">
+  <Folder>
+   <name>SPLAT!</name>
+     <description>Line-of-Sight Contour</description>
+       <GroundOverlay>
+         <name>SPLAT! Line-of-Sight Contour</name>
+           <description>SPLAT! Coverage</description>
+		<Icon>
+              <href>test_output2.ppm</href>
+		</Icon>
+            <LatLonBox>
+               <north>40.99917</north>
+               <south>39.00000</south>
+               <east>-119.00083</east>
+               <west>-121.00000</west>
+               <rotation>0.0</rotation>
+            </LatLonBox>
+       </GroundOverlay>
+     <Placemark>
+       <name>TX_Test</name>
+       <visibility>1</visibility>
+       <Style>
+       <IconStyle>
+        <Icon>
+          <href>root://icons/palette-5.png</href>
+          <x>224</x>
+          <y>224</y>
+          <w>32</w>
+          <h>32</h>
+        </Icon>
+       </IconStyle>
+       </Style>
+      <Point>
+        <extrude>1</extrude>
+        <altitudeMode>relativeToGround</altitudeMode>
+        <coordinates>-119.928517,39.589376,13.123360</coordinates>
+      </Point>
+     </Placemark>
+  </Folder>
+</kml>
