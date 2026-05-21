@@ -64,50 +64,33 @@ def generate_azimuth_pattern(antenna_type: str, rotation_deg: float = 0.0) -> st
     h_beamwidth = params['h_beamwidth']
     f2b_db = params['front_to_back_db']
     
-    # First line is rotation angle (set to 0 since we pre-rotate the pattern)
-    lines = ["0.0"]
-    
-    # Generate pattern for 0-360 degrees
-    # Pre-rotate the pattern so the boresight is at rotation_deg, not at 0°
+    # SPLAT!'s Azimuth() function returns standard compass bearings:
+    # 0=North, 90=East (clockwise).  The first line of the .az file
+    # tells SPLAT! how many degrees clockwise to rotate the raw pattern.
+    # We write an unrotated pattern (boresight at index 0) and let
+    # SPLAT!'s LoadPAT apply the rotation, which places the boresight
+    # at the requested compass bearing.
+    lines = [f"{rotation_deg:.1f}"]
+
+    # Generate the unrotated pattern (boresight at 0°)
     for angle in range(361):
         if antenna_type == 'omnidirectional':
-            # Perfect omnidirectional pattern (no rotation needed)
             pattern_value = 1.0
         else:
-            # Directional antenna pattern using smooth transitions
-            # Calculate angle relative to the desired pointing direction (rotation_deg)
-            # For example, if rotation_deg=90 (East), then angle=90 should be boresight (0° relative)
-            relative_angle = (angle - rotation_deg) % 360
+            # angle 0 = boresight, angle 180 = back of antenna
+            relative_angle = angle if angle <= 180 else 360 - angle
             
-            # Normalize to -180 to +180 range for symmetric pattern
-            if relative_angle > 180:
-                relative_angle = relative_angle - 360
-            
-            # Now work with absolute value for symmetric pattern
-            relative_angle = abs(relative_angle)
-            
-            # Calculate pattern value based on angle from boresight
-            # This creates a smooth Yagi-like pattern
-            
-            # Main lobe: cosine-squared taper (extends to ~2x the -3dB beamwidth)
             main_lobe_extent = h_beamwidth * 2
             main_lobe_factor = np.cos(min(relative_angle / main_lobe_extent, 1.0) * np.pi / 2) ** 2
             
-            # Side lobes: constant level at -12 dB
-            side_lobe_level = 10 ** (-12 / 20)  # ~0.251
-            
-            # Back lobe: constant level based on F/B ratio
+            side_lobe_level = 10 ** (-20 / 20)   # -20 dB (0.1 voltage ratio)
             back_lobe_level = 10 ** (-f2b_db / 20)  # ~0.056 for 25 dB F/B
             
-            # Blend between regions smoothly
             if relative_angle < main_lobe_extent:
-                # In main lobe region - use main lobe taper but don't go below side lobe level
                 pattern_value = max(main_lobe_factor, side_lobe_level)
             elif relative_angle < 150:
-                # Side lobe region (pure side lobe level)
                 pattern_value = side_lobe_level
             else:
-                # Back lobe region (150-180°)
                 pattern_value = back_lobe_level
         
         lines.append(f"{angle}\t{pattern_value:.7f}")

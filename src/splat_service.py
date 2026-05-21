@@ -10,6 +10,7 @@ our web application with progress tracking, caching, and multi-site support.
 """
 
 import os
+import sys
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -294,6 +295,13 @@ class SplatService:
             bounds = (lon, lat, lon + 1, lat + 1)
             
             try:
+                # The elevation library calls `make` as a subprocess, which only inherits
+                # the system PATH — not the conda env PATH. gdal_translate lives in the
+                # conda env bin directory, so we must inject it into PATH before the call.
+                conda_bin = str(Path(sys.executable).parent)
+                env_path = os.environ.get('PATH', '')
+                if conda_bin not in env_path:
+                    os.environ['PATH'] = conda_bin + os.pathsep + env_path
                 elevation.clip(bounds=bounds, output=output, product='SRTM3')
             except Exception as e:
                 print(f"  Warning: elevation.clip failed: {e}")
@@ -560,6 +568,9 @@ class SplatService:
             "-t", "tx.qth",
             "-L", "2.0",  # ITM coverage analysis with RX at 2m AGL (ground level receivers)
             "-dbm",       # Output received power in dBm (not field strength)
+            "-sc",        # Smooth contour interpolation — gives continuous color
+                          # gradients instead of 10 dB stepped bands, enabling
+                          # the frontend to resolve sub-10 dB directional diffs.
             "-m", "1.333",  # Four-thirds earth radius for atmospheric bending
             "-metric",
             "-R", str(radius_km),
@@ -672,39 +683,25 @@ class SplatService:
             g = img_array[:, :, 1]
             b = img_array[:, :, 2]
             
-            # SPLAT! -dbm mode uses colored contours for signal strength
-            # Background (no coverage) is gray (128,128,128) or white (255,255,255)
-            # Note: with -ngs flag, terrain is white, but we may also see other grays
-            is_background = ((r == 128) & (g == 128) & (b == 128)) | \
-                           ((r == 255) & (g == 255) & (b == 255)) | \
-                           ((r == 170) & (g == 170) & (b == 170)) | \
-                           ((r == g) & (g == b) & (r > 100))  # Any gray tone > 100
+            # SPLAT! -dbm mode uses colored contours for signal strength.
+            # With the -ngs flag, non-signal pixels are white (255,255,255).
+            # SPLAT! also emits black (0,0,0) for pixels outside DEM coverage
+            # ("should never get here" in WritePPMDBM).  Without -ngs it can
+            # also write gray terrain or blue sea-level, so we filter broadly.
+            is_background = (
+                ((r == 255) & (g == 255) & (b == 255)) |             # white
+                ((r == g) & (g == b) & (r > 100)) |                  # any gray > 100
+                ((r == 0) & (g == 0) & (b == 0)) |                   # black (no DEM data)
+                ((r == g) & (g == b) & (r < 10)) |                   # near-black
+                ((r == 0) & (g == 0) & (b == 170))                   # sea-level blue
+            )
             
             coverage_mask = ~is_background
             
             print(f"Coverage pixels: {np.sum(coverage_mask)} out of {coverage_mask.size}")
             logger.info(f"Coverage pixels: {np.sum(coverage_mask)}")
             
-            # SPLAT! dBm color definitions (from splat.txt documentation):
-            #   +0: 255,   0,   0     (red)
-            #  -10: 255, 128,   0     (orange-red)
-            #  -20: 255, 165,   0     (orange)
-            #  -30: 255, 206,   0     (yellow-orange)
-            #  -40: 255, 255,   0     (yellow)
-            #  -50: 184, 255,   0     (yellow-green)
-            #  -60:   0, 255,   0     (green)
-            #  -70:   0, 208,   0     (dark green)
-            #  -80:   0, 196, 196     (cyan)
-            #  -90:   0, 148, 255     (sky blue)
-            # -100:  80,  80, 255     (blue)
-            # -110:   0,  38, 255     (dark blue)
-            # -120: 142,  63, 255     (purple)
-            # -130: 196,  54, 255     (magenta)
-            # -140: 255,   0, 255     (bright magenta)
-            # -150: 255, 194, 204     (pink)
-            
-            # Define the color lookup table for vectorized processing
-            # Each entry: (r, g, b, dbm_value)
+            # SPLAT! dBm color definitions (from splat.txt documentation)
             splat_colors = [
                 (255, 0, 0, 0),           # Red = 0 dBm
                 (255, 128, 0, -10),       # Orange-red = -10 dBm
@@ -724,27 +721,49 @@ class SplatService:
                 (255, 194, 204, -150),    # Pink = -150 dBm
             ]
             
-            # Initialize signal strength with no-signal value
+            # Maximum squared RGB distance to accept a color as a valid
+            # SPLAT! signal color.  Anything farther is treated as a
+            # non-signal artifact (terrain bleed, rendering glitch, etc.).
+            MAX_COLOR_DIST_SQ = 15000
+            
+            # Pre-compute color array for vectorized distance calculation
+            splat_rgb = np.array([(cr, cg, cb) for cr, cg, cb, _ in splat_colors], dtype=np.float64)
+            splat_dbm = np.array([dbm for _, _, _, dbm in splat_colors], dtype=np.float64)
+            
             signal_strength = np.full(img_array.shape[:2], -200.0)
             
-            # Vectorized color matching - find closest SPLAT! color for each pixel
+            rejected_pixels = 0
             for row in range(img_array.shape[0]):
                 for col in range(img_array.shape[1]):
                     if coverage_mask[row, col]:
-                        red, green, blue = r[row, col], g[row, col], b[row, col]
+                        px = np.array([int(r[row, col]), int(g[row, col]), int(b[row, col])], dtype=np.float64)
                         
-                        # Find closest matching SPLAT! color
-                        min_dist = float('inf')
-                        best_dbm = -100.0
+                        dists = np.sum((splat_rgb - px) ** 2, axis=1)
+                        i1 = int(np.argmin(dists))
+                        d1 = dists[i1]
                         
-                        for cr, cg, cb, dbm in splat_colors:
-                            # Euclidean distance in RGB space
-                            dist = (red - cr)**2 + (green - cg)**2 + (blue - cb)**2
-                            if dist < min_dist:
-                                min_dist = dist
-                                best_dbm = dbm
+                        if d1 > MAX_COLOR_DIST_SQ:
+                            coverage_mask[row, col] = False
+                            rejected_pixels += 1
+                            continue
                         
-                        signal_strength[row, col] = best_dbm
+                        if d1 == 0:
+                            signal_strength[row, col] = splat_dbm[i1]
+                        else:
+                            # With smooth contours (-s), SPLAT! interpolates
+                            # colors between adjacent bands.  Recover the
+                            # actual dBm by inverse-distance weighting the
+                            # two closest reference colors.
+                            dists[i1] = np.inf
+                            i2 = int(np.argmin(dists))
+                            d2 = dists[i2]
+                            w1 = 1.0 / max(d1, 1e-9)
+                            w2 = 1.0 / max(d2, 1e-9)
+                            signal_strength[row, col] = (splat_dbm[i1] * w1 + splat_dbm[i2] * w2) / (w1 + w2)
+            
+            if rejected_pixels > 0:
+                print(f"Rejected {rejected_pixels} pixels with unrecognized colors")
+                logger.info(f"Rejected {rejected_pixels} pixels with unrecognized colors")
         else:
             # Grayscale fallback
             coverage_mask = img_array < 200

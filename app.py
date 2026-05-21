@@ -54,6 +54,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 from src.coverage_calculator import CoverageCalculator
+from src.export_service import export_kmz, export_geotiff
 from config import get_config, validate_config
 
 # ============================================================================
@@ -530,6 +531,58 @@ async def get_coverage_map(coverage_id: str, format: str = "png"):
     map_path = await generate_coverage_map_image(coverage_data, coverage_id, format)
     
     return FileResponse(map_path, media_type=f"image/{format}")
+
+@app.get("/api/coverage/{coverage_id}/export/kmz")
+async def export_coverage_kmz(coverage_id: str):
+    """Export coverage layer as a KMZ file (KML + PNG overlay) for Google Earth."""
+    if coverage_id not in coverage_storage:
+        raise HTTPException(status_code=404, detail="Coverage data not found")
+    
+    stored = coverage_storage[coverage_id]
+    if stored.get('status') != 'complete':
+        raise HTTPException(status_code=400, detail="Coverage calculation not complete")
+    
+    coverage_data = stored['coverage_data']
+    site_name = coverage_data.get('site_name', 'Coverage')
+    
+    try:
+        kmz_bytes = export_kmz(coverage_data, site_name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"KMZ export failed: {str(e)}")
+    
+    safe_name = site_name.replace(' ', '_').replace('/', '_')
+    return _binary_response(kmz_bytes, f'{safe_name}_coverage.kmz', 'application/vnd.google-earth.kmz')
+
+@app.get("/api/coverage/{coverage_id}/export/geotiff")
+async def export_coverage_geotiff(coverage_id: str):
+    """Export coverage layer as a GeoTIFF with signal strength in dBm."""
+    if coverage_id not in coverage_storage:
+        raise HTTPException(status_code=404, detail="Coverage data not found")
+    
+    stored = coverage_storage[coverage_id]
+    if stored.get('status') != 'complete':
+        raise HTTPException(status_code=400, detail="Coverage calculation not complete")
+    
+    coverage_data = stored['coverage_data']
+    site_name = coverage_data.get('site_name', 'Coverage')
+    
+    try:
+        tiff_bytes = export_geotiff(coverage_data, site_name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GeoTIFF export failed: {str(e)}")
+    
+    safe_name = site_name.replace(' ', '_').replace('/', '_')
+    return _binary_response(tiff_bytes, f'{safe_name}_coverage.tif', 'image/tiff')
+
+
+def _binary_response(data: bytes, filename: str, media_type: str):
+    """Return binary data as a downloadable file response."""
+    from starlette.responses import Response
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+    )
 
 @app.post("/api/coverage/upload")
 async def upload_sites_file(file: UploadFile = File(...)):

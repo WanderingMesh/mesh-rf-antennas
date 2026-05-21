@@ -59,6 +59,19 @@ class CoverageApp {
         
         L.control.layers(baseLayers).addTo(this.map);
         
+        // Signal-strength legend (bottom-right corner of the map).
+        // The legend updates dynamically when coverage is rendered
+        // to reflect the auto-scaled color range.
+        this._legendControl = L.control({ position: 'bottomright' });
+        this._legendControl.onAdd = () => {
+            const div = L.DomUtil.create('div', 'signal-legend');
+            div.id = 'signalLegend';
+            div.innerHTML = '<h4>Signal Strength</h4>'
+                + '<p class="legend-note">Run a calculation to see the color scale</p>';
+            return div;
+        };
+        this._legendControl.addTo(this.map);
+        
         // Add click handler for single site placement
         this.map.on('click', (e) => {
             if (!this.isCalculating) {
@@ -296,7 +309,7 @@ class CoverageApp {
                     
                     // Display results
                     this.displayResults({ coverage_id: coverageId, statistics: coverageData.statistics });
-                    await this.addCoverageToMap(coverageData);
+                    await this.addCoverageToMap(coverageData, coverageId);
                     
                     this.showSuccess('Coverage calculated successfully!');
                     return;
@@ -572,21 +585,59 @@ class CoverageApp {
         }
     }
     
-    async addCoverageToMap(coverageData) {
-        // Don't clear - allow accumulation of multiple sites
-        // Users can manually clear using the "Clear All Coverage" button
-        
+    async addCoverageToMap(coverageData, coverageId = null) {
         if (coverageData.coverage_mask) {
-            // Single site coverage
-            this.addSingleSiteCoverage(coverageData);
+            this.addSingleSiteCoverage(coverageData, coverageId);
         } else if (coverageData.site_coverage_data) {
-            // Multi-site coverage
             this.addMultiSiteCoverage(coverageData);
         }
     }
     
-    addSingleSiteCoverage(coverageData) {
-        // Render actual coverage mask data as image overlay
+    // Continuous heat-map gradient stops (strongest → weakest).
+    // We interpolate linearly between these stops so the full color
+    // range stretches across whatever signal range exists in the data,
+    // making directional patterns clearly visible even when all signals
+    // fall within a narrow dBm window.
+    static get GRADIENT_STOPS() {
+        return [
+            // t (0=strongest, 1=weakest), R, G, B
+            [0.00, 255,   0,   0],   // red       – strongest
+            [0.15, 255, 165,   0],   // orange
+            [0.30, 255, 255,   0],   // yellow
+            [0.45,   0, 255,   0],   // green
+            [0.60,   0, 196, 196],   // cyan
+            [0.75,   0, 100, 255],   // blue
+            [0.90, 142,  63, 255],   // purple
+            [1.00, 196,  54, 255],   // magenta   – weakest
+        ];
+    }
+
+    // Linearly interpolate within the gradient for a normalised t in [0,1].
+    // t=0 is strongest signal, t=1 is weakest.
+    static lerpGradient(t) {
+        const stops = CoverageApp.GRADIENT_STOPS;
+        if (t <= 0) return [stops[0][1], stops[0][2], stops[0][3]];
+        if (t >= 1) {
+            const last = stops[stops.length - 1];
+            return [last[1], last[2], last[3]];
+        }
+        for (let i = 1; i < stops.length; i++) {
+            if (t <= stops[i][0]) {
+                const [t0, r0, g0, b0] = stops[i - 1];
+                const [t1, r1, g1, b1] = stops[i];
+                const f = (t - t0) / (t1 - t0);
+                return [
+                    Math.round(r0 + (r1 - r0) * f),
+                    Math.round(g0 + (g1 - g0) * f),
+                    Math.round(b0 + (b1 - b0) * f),
+                ];
+            }
+        }
+        const last = stops[stops.length - 1];
+        return [last[1], last[2], last[3]];
+    }
+
+    addSingleSiteCoverage(coverageData, coverageId = null) {
         const coverageMask = coverageData.coverage_mask;
         const signalStrength = coverageData.signal_strength;
         const demBounds = coverageData.dem_bounds; // [west, south, east, north]
@@ -598,7 +649,6 @@ class CoverageApp {
         console.log('Coverage mask:', coverageMask ? `${coverageMask.length}x${coverageMask[0]?.length}` : 'null');
         console.log('DEM bounds [W,S,E,N]:', demBounds);
         
-        // Check if TX is within DEM bounds
         const [west, south, east, north] = demBounds;
         console.log('TX within bounds?', 
             `Lat ${txLat} in [${south}, ${north}]:`, txLat >= south && txLat <= north,
@@ -609,7 +659,7 @@ class CoverageApp {
             return;
         }
         
-        // Create canvas to render coverage
+        // Create canvas to render coverage with signal-strength heat map
         const height = coverageMask.length;
         const width = coverageMask[0].length;
         console.log(`Creating canvas: ${width}x${height}`);
@@ -619,32 +669,60 @@ class CoverageApp {
         const ctx = canvas.getContext('2d');
         const imageData = ctx.createImageData(width, height);
         
-        // Get color for this site (cycles through color array)
-        const siteColor = this.siteColors[this.currentColorIndex % this.siteColors.length];
-        const rgb = this.hexToRgb(siteColor);
+        // First pass: collect all signal values so we can compute
+        // percentile-based bounds.  Using raw min/max produces a huge
+        // range (e.g. 0 to -150 dBm) because of a few extreme pixels
+        // very close to the TX and at the fringe.  That compresses the
+        // useful directional differences into a tiny color slice.
+        // Percentile clipping (2nd–98th) focuses the gradient on the
+        // bulk of the data where directional patterns live.
+        const allSignals = [];
+        for (let row = 0; row < height; row++) {
+            for (let col = 0; col < width; col++) {
+                if (coverageMask[row][col]) {
+                    allSignals.push(signalStrength[row][col]);
+                }
+            }
+        }
+        allSignals.sort((a, b) => a - b);
+        const n = allSignals.length;
+        let sigMin, sigMax;
+        if (n === 0) {
+            sigMin = -120; sigMax = -60;
+        } else {
+            sigMin = allSignals[Math.floor(n * 0.02)];
+            sigMax = allSignals[Math.min(n - 1, Math.floor(n * 0.98))];
+        }
+        if (sigMax - sigMin < 5) sigMax = sigMin + 5;
+        const sigRange = sigMax - sigMin;
+        console.log(`Signal range (p2–p98): ${sigMax.toFixed(0)} to ${sigMin.toFixed(0)} dBm (${sigRange.toFixed(0)} dB span, ${n} pixels)`);
         
-        const getColor = (signalDbm) => {
-            // 75% transparency = 191 alpha (0.75 * 255)
-            return [rgb.r, rgb.g, rgb.b, 191];
-        };
+        // Store the range for the legend
+        this._lastSigMin = sigMin;
+        this._lastSigMax = sigMax;
         
-        // Render coverage mask to canvas
+        // Second pass: render each covered pixel using the continuous
+        // gradient stretched across [sigMin, sigMax].
+        const alpha = 200;
         let coveragePixelCount = 0;
         for (let row = 0; row < height; row++) {
             for (let col = 0; col < width; col++) {
                 const idx = (row * width + col) * 4;
                 
                 if (coverageMask[row][col]) {
-                    // Has coverage - color by signal strength
                     coveragePixelCount++;
                     const signal = signalStrength[row][col];
-                    const [r, g, b, a] = getColor(signal);
+                    // Clamp to [sigMin, sigMax] so outliers beyond the
+                    // percentile bounds saturate at the gradient endpoints
+                    // instead of producing out-of-range t values.
+                    const clamped = Math.max(sigMin, Math.min(sigMax, signal));
+                    const t = 1.0 - (clamped - sigMin) / sigRange;
+                    const [r, g, b] = CoverageApp.lerpGradient(t);
                     imageData.data[idx] = r;
                     imageData.data[idx + 1] = g;
                     imageData.data[idx + 2] = b;
-                    imageData.data[idx + 3] = a;
+                    imageData.data[idx + 3] = alpha;
                 } else {
-                    // No coverage - transparent
                     imageData.data[idx + 3] = 0;
                 }
             }
@@ -672,14 +750,16 @@ class CoverageApp {
         const layerInfo = {
             layer: imageOverlay,
             siteName: coverageData.site_name || 'Unknown Site',
-            color: siteColor,
+            coverageId: coverageId,
+            color: null,  // signal-strength heat map, no single site color
             visible: true
         };
         this.coverageLayers.push(layerInfo);
         this.currentColorIndex++;
         
-        // Update layer control panel
+        // Update layer control panel and signal legend
         this.updateLayerControl();
+        this.updateSignalLegend();
         
         // Fit map to coverage bounds
         this.map.fitBounds(bounds, { padding: [50, 50] });
@@ -832,7 +912,14 @@ class CoverageApp {
         this.coverageLayers = [];
         this.nodeMarkers = [];
         this.currentColorIndex = 0;
+        this._lastSigMin = null;
+        this._lastSigMax = null;
         this.updateLayerControl();
+        const legend = document.getElementById('signalLegend');
+        if (legend) {
+            legend.innerHTML = '<h4>Signal Strength</h4>'
+                + '<p class="legend-note">Run a calculation to see the color scale</p>';
+        }
     }
     
     hexToRgb(hex) {
@@ -861,21 +948,86 @@ class CoverageApp {
         this.coverageLayers.forEach((layerInfo, index) => {
             const layerItem = document.createElement('div');
             layerItem.className = 'layer-item';
+            
+            // Export buttons are only shown when we have a coverageId to reference
+            const exportButtons = layerInfo.coverageId ? `
+                <div style="display: flex; gap: 4px; margin-left: auto;">
+                    <button class="export-btn" data-id="${layerInfo.coverageId}" data-format="kmz" title="Export as KMZ (Google Earth)">KMZ</button>
+                    <button class="export-btn" data-id="${layerInfo.coverageId}" data-format="geotiff" title="Export as GeoTIFF (GIS)">TIF</button>
+                </div>
+            ` : '';
+            
+            // Heat-map layers get a gradient swatch; legacy flat-color layers get a solid swatch
+            const swatchStyle = layerInfo.color
+                ? `background-color: ${layerInfo.color};`
+                : `background: linear-gradient(to right, rgb(255,0,0), rgb(255,255,0), rgb(0,255,0), rgb(0,148,255), rgb(142,63,255));`;
+
             layerItem.innerHTML = `
-                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                    <input type="checkbox" id="layer-${index}" ${layerInfo.visible ? 'checked' : ''}>
-                    <span style="width: 16px; height: 16px; background-color: ${layerInfo.color}; border: 1px solid #ccc; border-radius: 3px;"></span>
-                    <span>${layerInfo.siteName}</span>
-                </label>
+                <div style="display: flex; align-items: center; gap: 8px; width: 100%;">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; flex: 1; min-width: 0;">
+                        <input type="checkbox" id="layer-${index}" ${layerInfo.visible ? 'checked' : ''}>
+                        <span style="width: 24px; height: 14px; flex-shrink: 0; ${swatchStyle} border: 1px solid #ccc; border-radius: 3px;"></span>
+                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${layerInfo.siteName}</span>
+                    </label>
+                    ${exportButtons}
+                </div>
             `;
             
-            const checkbox = layerItem.querySelector('input');
+            const checkbox = layerItem.querySelector('input[type="checkbox"]');
             checkbox.addEventListener('change', (e) => {
                 this.toggleLayerVisibility(index, e.target.checked);
             });
             
+            // Wire up export buttons
+            layerItem.querySelectorAll('.export-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    const covId = btn.dataset.id;
+                    const fmt = btn.dataset.format;
+                    this.exportLayer(covId, fmt);
+                });
+            });
+            
             layerList.appendChild(layerItem);
         });
+    }
+    
+    updateSignalLegend() {
+        const div = document.getElementById('signalLegend');
+        if (!div) return;
+
+        const min = this._lastSigMin;
+        const max = this._lastSigMax;
+        if (min == null || max == null) return;
+
+        // Build 7 evenly-spaced legend entries across the data range
+        const numSteps = 7;
+        let html = '<h4>Signal Strength (dBm)</h4><div class="legend-scale">';
+        for (let i = 0; i < numSteps; i++) {
+            const t = i / (numSteps - 1);              // 0 → 1
+            const dbm = max - t * (max - min);          // strongest → weakest
+            const [r, g, b] = CoverageApp.lerpGradient(t);
+            const label = i === 0 ? `${Math.round(dbm)} (strongest)`
+                        : i === numSteps - 1 ? `${Math.round(dbm)} (weakest)`
+                        : `${Math.round(dbm)}`;
+            html += `<div class="legend-item">`
+                + `<span class="legend-color" style="background:rgb(${r},${g},${b});"></span>`
+                + `<span class="legend-label">${label} dBm</span></div>`;
+        }
+        html += '</div>';
+        html += '<p class="legend-note">Colors auto-scaled to data range</p>';
+        div.innerHTML = html;
+    }
+
+    exportLayer(coverageId, format) {
+        const url = `/api/coverage/${coverageId}/export/${format}`;
+        // Trigger a browser download by navigating to the endpoint
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = '';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
     }
     
     toggleLayerVisibility(index, visible) {

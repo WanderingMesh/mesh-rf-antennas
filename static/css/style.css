@@ -465,3 +465,20 @@ body {
     background: #f0f8f0;
     color: #2e7d32;
 }
+
+.export-btn {
+    padding: 2px 6px;
+    font-size: 0.7em;
+    font-weight: bold;
+    border: 1px solid #aaa;
+    border-radius: 3px;
+    background: #f0f0f0;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.export-btn:hover {
+    background: #667eea;
+    color: white;
+    border-color: #667eea;
+}
