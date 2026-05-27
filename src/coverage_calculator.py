@@ -86,8 +86,10 @@ class CoverageCalculator:
         self.analysis_radius_km = dem_config.get('analysis_radius_km', 50.0)
         self.pixel_size_km = dem_config.get('pixel_size_km', 0.1)
         
-        # Climate zone for Longley-Rice model
-        self.climate_zone = rf_config.get('climate_zone', 'continental_temperate')
+        # Longley-Rice model environment parameters
+        self.climate_zone = rf_config.get('climate_zone', 'desert')
+        self.ground_type = rf_config.get('ground_type', 'desert')
+        self.fraction_of_time = rf_config.get('fraction_of_time', 0.50)
     
     def calculate_single_site_coverage(self, site_name: str, lat: float, lon: float, 
                                      elev_m: float, progress_callback=None) -> Dict:
@@ -143,6 +145,8 @@ class CoverageCalculator:
                 rx_sensitivity_dbm=self.rx_sensitivity_dbm,
                 analysis_radius_km=self.analysis_radius_km,
                 climate_zone=self.climate_zone,
+                ground_type=self.ground_type,
+                fraction_of_time=self.fraction_of_time,
                 progress_callback=progress_callback
             )
         else:

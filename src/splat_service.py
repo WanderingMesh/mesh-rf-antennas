@@ -78,7 +78,9 @@ class SplatService:
         antenna_tilt_azimuth: float = 0.0,
         rx_sensitivity_dbm: float = -100.0,
         analysis_radius_km: float = 50.0,
-        climate_zone: str = "continental_temperate",
+        climate_zone: str = "desert",
+        ground_type: str = "desert",
+        fraction_of_time: float = 0.50,
         progress_callback: Optional[Callable] = None
     ) -> Dict:
         """
@@ -126,7 +128,9 @@ class SplatService:
                     frequency_mhz=frequency_mhz,
                     tx_power_dbm=tx_power_dbm,
                     antenna_gain_dbi=antenna_gain_dbi,
-                    climate_zone=climate_zone
+                    climate_zone=climate_zone,
+                    ground_type=ground_type,
+                    fraction_of_time=fraction_of_time
                 )
                 
                 # Create antenna pattern files (azimuth and elevation patterns)
@@ -462,8 +466,22 @@ class SplatService:
         print(f"QTH file contents:")
         print(content)
     
+    # Ground dielectric constant and conductivity by terrain type.
+    # Values from SPLAT! documentation (splat.txt).
+    GROUND_PARAMS = {
+        "average":       (15.0, 0.005,  "Average Ground (Farmland/Forest)"),
+        "poor":          (4.0,  0.001,  "Poor Ground (Rocky/Dry)"),
+        "desert":        (13.0, 0.002,  "Desert / Dry Sand"),
+        "good":          (25.0, 0.020,  "Good Ground (Rich Soil)"),
+        "fresh_water":   (80.0, 0.010,  "Fresh Water"),
+        "salt_water":    (80.0, 5.000,  "Salt Water / Salt Flat"),
+        "marshy":        (12.0, 0.007,  "Marshy Land"),
+        "city":          (5.0,  0.001,  "City / Urban"),
+    }
+
     def _create_lrp_file(self, path: Path, frequency_mhz: float, tx_power_dbm: float, 
-                        antenna_gain_dbi: float = 0.0, climate_zone: str = "continental_temperate"):
+                        antenna_gain_dbi: float = 0.0, climate_zone: str = "desert",
+                        ground_type: str = "desert", fraction_of_time: float = 0.50):
         """
         Create SPLAT! LRP (Longley-Rice parameters) file.
         
@@ -478,12 +496,11 @@ class SplatService:
         1: Equatorial (Congo)
         2: Continental Subtropical (Sudan)
         3: Maritime Subtropical (West coast of Africa)
-        4: Desert (Sahara)
-        5: Continental Temperate
-        6: Maritime Temperate, over land (UK and west coasts of US & Europe)
-        7: Maritime Temperate, over sea
+        4: Desert (Sahara, Great Basin, Mojave)
+        5: Continental Temperate (US interior)
+        6: Maritime Temperate, over land (UK, Pacific NW)
+        7: Maritime Temperate, over sea (open ocean, coastal)
         """
-        # Map climate zone names to SPLAT! codes
         climate_codes = {
             "equatorial": 1,
             "continental_subtropical": 2,
@@ -493,7 +510,14 @@ class SplatService:
             "maritime_temperate_land": 6,
             "maritime_temperate_sea": 7,
         }
-        climate_code = climate_codes.get(climate_zone, 5)  # Default to continental temperate
+        climate_code = climate_codes.get(climate_zone, 4)
+        
+        dielectric, conductivity, ground_desc = self.GROUND_PARAMS.get(
+            ground_type, self.GROUND_PARAMS["desert"]
+        )
+        
+        # Clamp fraction_of_time to the valid ITM range
+        fraction_of_time = max(0.01, min(0.99, fraction_of_time))
         
         system_loss_db = 0.0
         erp_watts = 10 ** ((tx_power_dbm + antenna_gain_dbi - system_loss_db - 30) / 10)
@@ -504,20 +528,23 @@ class SplatService:
         print(f"  System Loss: {system_loss_db} dB")
         print(f"  Calculated ERP: {erp_watts:.4f} watts ({10 * np.log10(erp_watts * 1000):.2f} dBm)")
         print(f"  Climate Zone: {climate_zone} (code {climate_code})")
+        print(f"  Ground Type: {ground_desc} (εr={dielectric}, σ={conductivity} S/m)")
+        print(f"  Fraction of time: {fraction_of_time}")
         print(f"  Frequency: {frequency_mhz} MHz")
         
-        content = f"""15.000  ; Earth Dielectric Constant (typical for average ground)
-0.005000  ; Earth Conductivity (S/m, typical for average ground)
+        content = f"""{dielectric:.3f}  ; Earth Dielectric Constant ({ground_desc})
+{conductivity:.6f}  ; Earth Conductivity S/m ({ground_desc})
 301.000  ; Atmospheric Bending Constant (N-units)
 {frequency_mhz:.3f}  ; Frequency in MHz
 {climate_code}  ; Radio Climate ({climate_zone})
 1  ; Polarization (1 = Vertical)
 0.50  ; Fraction of situations (0.5 = median/typical)
-0.50  ; Fraction of time (0.5 = median/typical)
+{fraction_of_time:.2f}  ; Fraction of time
 {erp_watts:.4f}  ; ERP in Watts (TX {tx_power_dbm} dBm + Gain {antenna_gain_dbi} dBi)
 """
         path.write_text(content)
-        logger.info(f"Created LRP file with ERP={erp_watts:.4f}W, Freq={frequency_mhz}MHz")
+        logger.info(f"Created LRP file with ERP={erp_watts:.4f}W, Freq={frequency_mhz}MHz, "
+                     f"Ground={ground_type}, Climate={climate_zone}, FoT={fraction_of_time}")
     
     def _create_antenna_pattern_files(self, work_dir: Path, antenna_type: str, antenna_azimuth: float,
                                       antenna_tilt: float = 0.0, antenna_tilt_azimuth: float = 0.0):

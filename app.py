@@ -76,7 +76,9 @@ class SingleSiteRequest(BaseModel):
     antenna_tilt_azimuth: float = Field(0.0, ge=0, le=360, description="Compass direction the antenna tilts toward (0=North, 90=East)")
     rx_sensitivity_dbm: float = Field(-100.0, ge=-150, le=-50, description="Receiver sensitivity in dBm")
     analysis_radius_km: float = Field(50.0, ge=1, le=200, description="Analysis radius in kilometers")
-    climate_zone: str = Field("continental_temperate", description="Climate zone")
+    climate_zone: str = Field("desert", description="ITU climate zone for propagation model")
+    ground_type: str = Field("desert", description="Ground type affecting dielectric/conductivity")
+    fraction_of_time: float = Field(0.50, ge=0.01, le=0.99, description="Fraction of time reliability (lower = more optimistic)")
 
 class MultiSiteRequest(BaseModel):
     """Request model for multi-site coverage calculation."""
@@ -91,7 +93,9 @@ class MultiSiteRequest(BaseModel):
     antenna_tilt_azimuth: float = Field(0.0, ge=0, le=360, description="Compass direction the antenna tilts toward (0=North, 90=East)")
     rx_sensitivity_dbm: float = Field(-100.0, ge=-150, le=-50, description="Receiver sensitivity in dBm")
     analysis_radius_km: float = Field(50.0, ge=1, le=200, description="Analysis radius in kilometers")
-    climate_zone: str = Field("continental_temperate", description="Climate zone")
+    climate_zone: str = Field("desert", description="ITU climate zone for propagation model")
+    ground_type: str = Field("desert", description="Ground type affecting dielectric/conductivity")
+    fraction_of_time: float = Field(0.50, ge=0.01, le=0.99, description="Fraction of time reliability (lower = more optimistic)")
 
 class CoverageResponse(BaseModel):
     """Response model for coverage calculations."""
@@ -188,9 +192,14 @@ init_db()
 def get_site_key(lat: float, lon: float, elev_m: float, frequency_mhz: float, tx_power_dbm: float, 
                  antenna_gain_dbi: float = 0.0, antenna_type: str = "omnidirectional", antenna_azimuth: float = 0.0,
                  antenna_tilt: float = 0.0, antenna_tilt_azimuth: float = 0.0,
-                 rx_sensitivity_dbm: float = -100.0, analysis_radius_km: float = 50.0) -> str:
+                 rx_sensitivity_dbm: float = -100.0, analysis_radius_km: float = 50.0,
+                 climate_zone: str = "desert", ground_type: str = "desert",
+                 fraction_of_time: float = 0.50) -> str:
     """Generate unique key for a site configuration (rounded to avoid float precision issues)."""
-    return f"{lat:.6f}_{lon:.6f}_{elev_m:.1f}_{frequency_mhz:.1f}_{tx_power_dbm:.1f}_{antenna_gain_dbi:.1f}_{antenna_type}_{antenna_azimuth:.1f}_{antenna_tilt:.1f}_{antenna_tilt_azimuth:.1f}_{rx_sensitivity_dbm:.0f}_{analysis_radius_km:.0f}"
+    return (f"{lat:.6f}_{lon:.6f}_{elev_m:.1f}_{frequency_mhz:.1f}_{tx_power_dbm:.1f}_"
+            f"{antenna_gain_dbi:.1f}_{antenna_type}_{antenna_azimuth:.1f}_{antenna_tilt:.1f}_"
+            f"{antenna_tilt_azimuth:.1f}_{rx_sensitivity_dbm:.0f}_{analysis_radius_km:.0f}_"
+            f"{climate_zone}_{ground_type}_{fraction_of_time:.2f}")
 
 def load_cached_coverage(site_key: str) -> Optional[Dict]:
     """Load coverage data from database if it exists."""
@@ -307,7 +316,9 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
                                request.frequency_mhz, request.tx_power_dbm, request.antenna_gain_dbi,
                                request.antenna_type, request.antenna_azimuth,
                                request.antenna_tilt, request.antenna_tilt_azimuth,
-                               request.rx_sensitivity_dbm, request.analysis_radius_km)
+                               request.rx_sensitivity_dbm, request.analysis_radius_km,
+                               request.climate_zone, request.ground_type,
+                               request.fraction_of_time)
         
         # Check if we have cached coverage for this exact site
         cached_coverage = load_cached_coverage(site_key)
@@ -330,7 +341,6 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
             'progress_message': 'Initializing calculation...'
         })
         
-        # Create coverage calculator with request parameters
         calc_config = config.copy()
         calc_config['rf'].update({
             'frequency_mhz': request.frequency_mhz,
@@ -341,7 +351,9 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
             'antenna_tilt': request.antenna_tilt,
             'antenna_tilt_azimuth': request.antenna_tilt_azimuth,
             'rx_sensitivity_dbm': request.rx_sensitivity_dbm,
-            'climate_zone': request.climate_zone
+            'climate_zone': request.climate_zone,
+            'ground_type': request.ground_type,
+            'fraction_of_time': request.fraction_of_time
         })
         calc_config['dem'].update({
             'analysis_radius_km': request.analysis_radius_km
@@ -349,14 +361,12 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
         
         calculator = CoverageCalculator(calc_config)
         
-        # Create progress callback
         def progress_callback(progress: float, message: str):
             coverage_storage[coverage_id].update({
                 'progress': progress,
                 'progress_message': message
             })
         
-        # Calculate coverage with progress updates
         coverage_data = calculator.calculate_single_site_coverage(
             site_name=request.site_name,
             lat=request.lat,
@@ -406,7 +416,6 @@ async def calculate_multi_site_coverage(request: MultiSiteRequest):
                 detail=f"Missing required columns. Need: {required_columns}"
             )
         
-        # Create coverage calculator with request parameters
         calc_config = config.copy()
         calc_config['rf'].update({
             'frequency_mhz': request.frequency_mhz,
@@ -417,7 +426,9 @@ async def calculate_multi_site_coverage(request: MultiSiteRequest):
             'antenna_tilt': request.antenna_tilt,
             'antenna_tilt_azimuth': request.antenna_tilt_azimuth,
             'rx_sensitivity_dbm': request.rx_sensitivity_dbm,
-            'climate_zone': request.climate_zone
+            'climate_zone': request.climate_zone,
+            'ground_type': request.ground_type,
+            'fraction_of_time': request.fraction_of_time
         })
         calc_config['dem'].update({
             'analysis_radius_km': request.analysis_radius_km
@@ -425,7 +436,6 @@ async def calculate_multi_site_coverage(request: MultiSiteRequest):
         
         calculator = CoverageCalculator(calc_config)
         
-        # Calculate coverage
         coverage_data = calculator.calculate_multi_site_coverage(
             sites_df=sites_df,
             show_nodes=request.show_nodes

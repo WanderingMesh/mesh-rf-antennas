@@ -157,6 +157,19 @@ class CoverageApp {
             this.updateTiltAzimuthDirection(e.target.value);
         });
         
+        // Reliability slider sync — display as percentage
+        const fotSlider = document.getElementById('fractionOfTime');
+        const fotDisplay = document.getElementById('fractionOfTimeValue');
+        fotSlider.addEventListener('input', () => {
+            fotDisplay.textContent = `${Math.round(parseFloat(fotSlider.value) * 100)}%`;
+        });
+        
+        // Theme toggle
+        document.getElementById('themeToggle').addEventListener('click', () => {
+            this.toggleTheme();
+        });
+        this.applyStoredTheme();
+        
         // Initialize gain field with default antenna type's gain
         const initialAntennaType = document.getElementById('antennaType').value;
         this.handleAntennaTypeChange(initialAntennaType);
@@ -177,11 +190,11 @@ class CoverageApp {
         const max = parseFloat(input.max);
         
         if (isNaN(value) || value < min || value > max) {
-            input.style.borderColor = '#c62828';
-            input.style.backgroundColor = '#ffebee';
+            input.style.borderColor = 'var(--validation-bad-border)';
+            input.style.backgroundColor = 'var(--validation-bad-bg)';
         } else {
-            input.style.borderColor = '#ddd';
-            input.style.backgroundColor = 'white';
+            input.style.borderColor = '';
+            input.style.backgroundColor = '';
         }
     }
     
@@ -407,14 +420,16 @@ class CoverageApp {
                 elev_m: elev,
                 frequency_mhz: parseFloat(document.getElementById('frequency').value),
                 tx_power_dbm: parseFloat(document.getElementById('txPower').value),
-                antenna_gain_dbi: parseFloat(document.getElementById('antennaGain').value),  // Read from gain field (auto-filled or custom)
+                antenna_gain_dbi: parseFloat(document.getElementById('antennaGain').value),
                 antenna_type: document.getElementById('antennaType').value,
                 antenna_azimuth: parseFloat(document.getElementById('antennaAzimuthValue').value),
                 antenna_tilt: parseFloat(document.getElementById('antennaTiltValue').value),
                 antenna_tilt_azimuth: parseFloat(document.getElementById('tiltAzimuthValue').value),
                 rx_sensitivity_dbm: parseFloat(document.getElementById('rxSensitivity').value),
                 analysis_radius_km: parseFloat(document.getElementById('analysisRadius').value),
-                climate_zone: document.getElementById('climateZone').value
+                climate_zone: document.getElementById('climateZone').value,
+                ground_type: document.getElementById('groundType').value,
+                fraction_of_time: parseFloat(document.getElementById('fractionOfTime').value)
             };
             
             const response = await fetch('/api/coverage/single', {
@@ -480,14 +495,16 @@ class CoverageApp {
                 show_nodes: document.getElementById('showNodes').checked,
                 frequency_mhz: parseFloat(document.getElementById('frequency').value),
                 tx_power_dbm: parseFloat(document.getElementById('txPower').value),
-                antenna_gain_dbi: parseFloat(document.getElementById('antennaGain').value),  // Read from gain field (auto-filled or custom)
+                antenna_gain_dbi: parseFloat(document.getElementById('antennaGain').value),
                 antenna_type: document.getElementById('antennaType').value,
                 antenna_azimuth: parseFloat(document.getElementById('antennaAzimuthValue').value),
                 antenna_tilt: parseFloat(document.getElementById('antennaTiltValue').value),
                 antenna_tilt_azimuth: parseFloat(document.getElementById('tiltAzimuthValue').value),
                 rx_sensitivity_dbm: parseFloat(document.getElementById('rxSensitivity').value),
                 analysis_radius_km: parseFloat(document.getElementById('analysisRadius').value),
-                climate_zone: document.getElementById('climateZone').value
+                climate_zone: document.getElementById('climateZone').value,
+                ground_type: document.getElementById('groundType').value,
+                fraction_of_time: parseFloat(document.getElementById('fractionOfTime').value)
             };
             
             const response = await fetch('/api/coverage/multi', {
@@ -1077,6 +1094,26 @@ class CoverageApp {
         this.updateStatus(message);
         // You could add a toast notification here
         console.log(message);
+    }
+    
+    applyStoredTheme() {
+        const stored = localStorage.getItem('rf-theme') || 'light';
+        document.documentElement.setAttribute('data-theme', stored);
+        this.updateThemeIcon(stored);
+    }
+    
+    toggleTheme() {
+        const current = document.documentElement.getAttribute('data-theme') || 'light';
+        const next = current === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', next);
+        localStorage.setItem('rf-theme', next);
+        this.updateThemeIcon(next);
+    }
+    
+    updateThemeIcon(theme) {
+        const icon = document.getElementById('themeIcon');
+        if (!icon) return;
+        icon.className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
     }
     
     addSignalStrengthLegend() {
