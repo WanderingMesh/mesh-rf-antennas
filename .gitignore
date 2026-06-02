@@ -3,5 +3,4 @@ splat_src/*
 *.md
 nevada_viewshed.db
 nevada_dem.tif
-gh.token
-coverage_db/coverage_cache.db
+
