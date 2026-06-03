@@ -163,6 +163,7 @@ class CoverageApp {
         fotSlider.addEventListener('input', () => {
             fotDisplay.textContent = `${Math.round(parseFloat(fotSlider.value) * 100)}%`;
         });
+        fotDisplay.textContent = `${Math.round(parseFloat(fotSlider.value) * 100)}%`;
         
         // Theme toggle
         document.getElementById('themeToggle').addEventListener('click', () => {
