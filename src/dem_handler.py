@@ -21,6 +21,7 @@ from rasterio.transform import from_bounds
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 import elevation
 import os
+import sys
 from pathlib import Path
 from typing import Tuple, Optional, Dict
 import warnings
@@ -95,6 +96,15 @@ class DEMHandler:
                 product = 'SRTM3'  # Default to 90m
             
             print(f"Downloading {product} data...")
+            # The elevation library invokes `make`, which shells out to the GDAL
+            # command-line tools (gdal_translate, gdalbuildvrt). Those binaries live
+            # in the active conda env's bin directory, but a subprocess only inherits
+            # the system PATH. Inject the interpreter's bin dir so the download works
+            # regardless of how the app was launched (IDE, cron, activated shell, etc.).
+            conda_bin = str(Path(sys.executable).parent)
+            env_path = os.environ.get('PATH', '')
+            if conda_bin not in env_path.split(os.pathsep):
+                os.environ['PATH'] = conda_bin + os.pathsep + env_path
             elevation.clip(bounds=bounds, output=str(cache_file), product=product)
             
             # Load the downloaded data
