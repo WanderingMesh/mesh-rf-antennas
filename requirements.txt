@@ -13,9 +13,13 @@ scipy>=1.11.0
 
 # Geospatial processing and DEM handling
 # NOTE: The GDAL command-line tools (gdal_translate, gdalbuildvrt) are a SYSTEM
-# dependency, not a pip package. The `elevation` package shells out to them via a
-# Makefile, so they must be on PATH. Install them into this env with conda:
-#   conda install -c conda-forge gdal
+# dependency, NOT a pip package. The `elevation` package shells out to them via a
+# Makefile, so they must be installed separately and be on PATH. See README.txt
+# for the full per-platform prerequisite instructions. Quick reference:
+#   macOS:          brew install gdal
+#   Debian/Ubuntu:  sudo apt-get install -y gdal-bin
+#   RHEL/Fedora:    sudo dnf install -y gdal
+#   any OS (conda): conda install -c conda-forge gdal
 rasterio>=1.2.0
 elevation>=1.1.0
 geopandas>=0.10.0
