@@ -2,9 +2,14 @@
 # Production-ready web application for RF coverage mapping
 
 # Core scientific computing
-numpy>=1.21.0,<2.0.0
-pandas>=1.3.0,<2.0.0
-scipy>=1.7.0
+# NOTE: Aligned on the numpy 2.x ABI. The GDAL CLI/bindings (conda-forge, built
+# "np2") and the rest of the compiled geospatial stack (rasterio, shapely,
+# scipy, geopandas) are all numpy-2 builds, so numpy must stay >=2. pandas <2.0
+# is NOT ABI-compatible with numpy 2 (raises "numpy.dtype size changed"), so
+# pandas is bumped to >=2.2.2 (first release with official numpy 2 support).
+numpy>=2.0.0,<3.0.0
+pandas>=2.2.2,<3.0.0
+scipy>=1.11.0
 
 # Geospatial processing and DEM handling
 rasterio>=1.2.0
