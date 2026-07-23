@@ -4,3 +4,15 @@ splat_src/*
 nevada_viewshed.db
 nevada_dem.tif
 
+# Python bytecode / caches (should never be committed; regenerated per interpreter)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Common Python env / build artifacts
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+
