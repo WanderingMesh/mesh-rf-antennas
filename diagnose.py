@@ -33,18 +33,37 @@ else:
     sys.exit(1)
 
 # Check 2: Verify cache key includes antenna parameters
+# WHY regex instead of exact-string matching: the get_site_key() signature grows
+# over time as new parameters are added (tilt, climate zone, etc.). Matching the
+# exact old signature caused false "WRONG" results whenever the function evolved.
+# Instead, we extract the actual function body and verify the antenna parameters
+# appear in both the signature and the returned key string.
 print("\n2. Checking cache key...")
 app_path = Path("app.py")
 if app_path.exists():
+    import re
     content = app_path.read_text()
-    if 'antenna_type: str = "omnidirectional", antenna_azimuth: float = 0.0) -> str:' in content:
+    # Capture everything from "def get_site_key" through its return statement
+    func_match = re.search(
+        r'def get_site_key\((?P<sig>.*?)\)\s*->\s*str:.*?return\s*\((?P<ret>.*?)\)',
+        content, re.DOTALL
+    )
+    if not func_match:
+        print("   ✗ ERROR: Could not locate get_site_key() in app.py")
+        sys.exit(1)
+
+    signature = func_match.group('sig')
+    return_expr = func_match.group('ret')
+
+    if 'antenna_type' in signature and 'antenna_azimuth' in signature:
         print("   ✓ CORRECT: Cache key includes antenna_type and antenna_azimuth")
     else:
         print("   ✗ WRONG: Cache key missing antenna parameters - changes won't trigger recalculation!")
         sys.exit(1)
-    
-    # Check the return statement
-    if 'antenna_type}_{antenna_azimuth:.1f}' in content:
+
+    # The parameters must also appear in the returned key string, otherwise
+    # different antenna configs would collide on the same cache entry.
+    if 'antenna_type' in return_expr and 'antenna_azimuth' in return_expr:
         print("   ✓ CORRECT: Cache key returns antenna_type and antenna_azimuth")
     else:
         print("   ✗ WRONG: Cache key doesn't include antenna parameters in return value!")

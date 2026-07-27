@@ -1,6 +1,27 @@
 dem_cache/*
-splat_src/*
 *.md
 nevada_viewshed.db
 nevada_dem.tif
+
+# Runtime coverage cache database (regenerated per-machine)
+coverage_db/
+
+# SPLAT! build artifacts: the SOURCE is tracked so any clone can rebuild,
+# but compiled binaries are architecture-specific (macOS arm64 vs Linux x86)
+# and must be built per-machine with ./build_splat.sh
+splat_src/splat-1.4.2.tar
+splat_src/splat-1.4.2/splat.h
+splat_src/splat-1.4.2/splat
+splat_src/splat-1.4.2/splat-hd
+splat_src/splat-1.4.2/utils/bearing
+splat_src/splat-1.4.2/utils/citydecoder
+splat_src/splat-1.4.2/utils/fontdata
+splat_src/splat-1.4.2/utils/srtm2sdf
+splat_src/splat-1.4.2/utils/srtm2sdf-hd
+splat_src/splat-1.4.2/utils/usgs2sdf
+*.o
+
+# Python bytecode
+__pycache__/
+*.pyc
 
