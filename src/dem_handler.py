@@ -157,7 +157,10 @@ class DEMHandler:
         Returns:
             Tuple of (row, col) pixel coordinates
         """
-        col, row = rasterio.transform.rowcol(transform, lon, lat)
+        # rasterio.transform.rowcol returns (row, col) — the previous code
+        # unpacked it as (col, row), silently transposing every coordinate
+        # lookup in the Python-fallback terrain profile path.
+        row, col = rasterio.transform.rowcol(transform, lon, lat)
         return row, col
     
     def pixel_to_latlon(self, row: int, col: int, transform: rasterio.transform.Affine) -> Tuple[float, float]:

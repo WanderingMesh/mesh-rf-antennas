@@ -23,6 +23,7 @@ API Endpoints:
 - GET /api/coverage/{coverage_id}/map - Get coverage map image
 """
 
+import copy
 import os
 import sys
 import json
@@ -80,9 +81,21 @@ class SingleSiteRequest(BaseModel):
     ground_type: str = Field("desert", description="Ground type affecting dielectric/conductivity")
     fraction_of_time: float = Field(0.50, ge=0.01, le=0.99, description="Fraction of time reliability (lower = more optimistic)")
 
+class Site(BaseModel):
+    """A single site within a multi-site coverage request.
+
+    This must be a real model rather than Dict[str, float]: the 'name'
+    field is a string, so a float-valued dict type would reject every
+    request with a 422 before the handler ever ran.
+    """
+    name: str = Field(..., description="Site name")
+    lat: float = Field(..., ge=-90, le=90, description="Latitude in decimal degrees")
+    lon: float = Field(..., ge=-180, le=180, description="Longitude in decimal degrees")
+    elev: float = Field(..., ge=0, le=10000, description="Antenna height AGL in meters")
+
 class MultiSiteRequest(BaseModel):
     """Request model for multi-site coverage calculation."""
-    sites: List[Dict[str, float]] = Field(..., description="List of sites with lat, lon, elev")
+    sites: List[Site] = Field(..., description="List of sites with name, lat, lon, elev")
     show_nodes: bool = Field(True, description="Whether to show node locations")
     frequency_mhz: float = Field(900.0, ge=100, le=6000, description="Frequency in MHz")
     tx_power_dbm: float = Field(30.0, ge=-50, le=50, description="Transmitter power in dBm")
@@ -320,8 +333,10 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
                                request.climate_zone, request.ground_type,
                                request.fraction_of_time)
         
-        # Check if we have cached coverage for this exact site
-        cached_coverage = load_cached_coverage(site_key)
+        # Check if we have cached coverage for this exact site.
+        # Run in a worker thread: deserializing large pickled coverage
+        # blobs from SQLite would otherwise stall the event loop.
+        cached_coverage = await asyncio.to_thread(load_cached_coverage, site_key)
         
         if cached_coverage:
             print(f"Using cached coverage for {site_key}")
@@ -341,7 +356,11 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
             'progress_message': 'Initializing calculation...'
         })
         
-        calc_config = config.copy()
+        # Deep copy is required: a shallow .copy() shares the nested
+        # 'rf'/'dem' dicts with the module-level defaults, so the
+        # .update() calls below would mutate global config and leak
+        # parameters between concurrent requests.
+        calc_config = copy.deepcopy(config)
         calc_config['rf'].update({
             'frequency_mhz': request.frequency_mhz,
             'tx_power_dbm': request.tx_power_dbm,
@@ -367,7 +386,13 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
                 'progress_message': message
             })
         
-        coverage_data = calculator.calculate_single_site_coverage(
+        # The calculation is fully synchronous (SPLAT! subprocess, terrain
+        # downloads, pixel processing). Running it directly in this coroutine
+        # would freeze the event loop for the entire calculation, making the
+        # /status polling endpoint unresponsive. to_thread keeps the server
+        # (and the progress bar) alive while SPLAT! runs.
+        coverage_data = await asyncio.to_thread(
+            calculator.calculate_single_site_coverage,
             site_name=request.site_name,
             lat=request.lat,
             lon=request.lon,
@@ -375,10 +400,14 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
             progress_callback=progress_callback
         )
         
-        # Save to database for future reuse
-        save_coverage_to_db(site_key, request.site_name, request.lat, request.lon,
-                           request.elev_m, request.frequency_mhz, request.tx_power_dbm, request.antenna_gain_dbi,
-                           coverage_data)
+        # Save to database for future reuse (threaded for the same reason:
+        # pickling + writing multi-MB blobs blocks)
+        await asyncio.to_thread(
+            save_coverage_to_db,
+            site_key, request.site_name, request.lat, request.lon,
+            request.elev_m, request.frequency_mhz, request.tx_power_dbm, request.antenna_gain_dbi,
+            coverage_data
+        )
         
         # Update storage with results
         coverage_storage[coverage_id].update({
@@ -405,18 +434,13 @@ async def calculate_multi_site_coverage(request: MultiSiteRequest):
         # Generate unique coverage ID
         coverage_id = str(uuid.uuid4())
         
-        # Convert sites to DataFrame
-        sites_df = pd.DataFrame(request.sites)
+        # Convert validated Site models to a DataFrame. Pydantic has already
+        # enforced the required fields and ranges, so no column check needed.
+        sites_df = pd.DataFrame([site.dict() for site in request.sites])
         
-        # Validate required columns
-        required_columns = ['name', 'lat', 'lon', 'elev']
-        if not all(col in sites_df.columns for col in required_columns):
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Missing required columns. Need: {required_columns}"
-            )
-        
-        calc_config = config.copy()
+        # Deep copy for the same reason as the single-site path: a shallow
+        # copy would let these updates mutate the global default config.
+        calc_config = copy.deepcopy(config)
         calc_config['rf'].update({
             'frequency_mhz': request.frequency_mhz,
             'tx_power_dbm': request.tx_power_dbm,
@@ -436,7 +460,10 @@ async def calculate_multi_site_coverage(request: MultiSiteRequest):
         
         calculator = CoverageCalculator(calc_config)
         
-        coverage_data = calculator.calculate_multi_site_coverage(
+        # Threaded so the synchronous per-site terrain work doesn't
+        # freeze the event loop for the duration of the calculation.
+        coverage_data = await asyncio.to_thread(
+            calculator.calculate_multi_site_coverage,
             sites_df=sites_df,
             show_nodes=request.show_nodes
         )
@@ -677,6 +704,37 @@ async def list_cached_sites(admin_key: str = Depends(verify_admin_key)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing cached sites: {str(e)}")
 
+# NOTE: /api/cache/clear MUST be registered before /api/cache/{site_key}.
+# FastAPI matches routes in declaration order, so if the parameterized
+# route came first, DELETE /api/cache/clear would be captured as
+# site_key="clear" and return 404 instead of clearing the cache.
+@app.delete("/api/cache/clear")
+async def clear_all_cache(admin_key: str = Depends(verify_admin_key)):
+    """
+    Clear all cached coverage data.
+    
+    Requires admin API key in Authorization header:
+    Authorization: Bearer {ADMIN_API_KEY}
+    
+    WARNING: This deletes ALL cached coverage calculations!
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM site_coverage')
+        count = cursor.fetchone()[0]
+        cursor.execute('DELETE FROM site_coverage')
+        conn.commit()
+        conn.close()
+        
+        return {
+            'status': 'success',
+            'message': f'Cleared {count} cached sites',
+            'deleted': count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error clearing cache: {str(e)}")
+
 @app.delete("/api/cache/{site_key}")
 async def delete_cached_site(site_key: str, admin_key: str = Depends(verify_admin_key)):
     """
@@ -705,33 +763,6 @@ async def delete_cached_site(site_key: str, admin_key: str = Depends(verify_admi
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting cached site: {str(e)}")
-
-@app.delete("/api/cache/clear")
-async def clear_all_cache(admin_key: str = Depends(verify_admin_key)):
-    """
-    Clear all cached coverage data.
-    
-    Requires admin API key in Authorization header:
-    Authorization: Bearer {ADMIN_API_KEY}
-    
-    WARNING: This deletes ALL cached coverage calculations!
-    """
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM site_coverage')
-        count = cursor.fetchone()[0]
-        cursor.execute('DELETE FROM site_coverage')
-        conn.commit()
-        conn.close()
-        
-        return {
-            'status': 'success',
-            'message': f'Cleared {count} cached sites',
-            'deleted': count
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error clearing cache: {str(e)}")
 
 # ============================================================================
 # UTILITY FUNCTIONS
