@@ -132,11 +132,16 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS middleware
+# CORS middleware.
+# allow_credentials must be False with a wildcard origin: the CORS spec
+# forbids the combination (browsers reject "Access-Control-Allow-Origin: *"
+# on credentialed requests), and Starlette silently drops the wildcard.
+# Nothing here needs cookies — the admin endpoints use a Bearer header,
+# which is covered by allow_headers.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
-    allow_credentials=True,
+    allow_origins=["*"],  # Restrict to specific domains for production
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -151,6 +156,28 @@ templates = Jinja2Templates(directory="templates")
 config = get_config('default')
 coverage_storage = {}  # In-memory cache
 
+# Cap on in-memory results. Each entry can hold multi-MB coverage arrays,
+# so unbounded growth would eventually exhaust RAM on a long-running server.
+MAX_COVERAGE_RESULTS = 25
+
+def prune_coverage_storage():
+    """Evict the oldest completed results when the in-memory store exceeds
+    MAX_COVERAGE_RESULTS.
+
+    In-flight ('processing') calculations are never evicted. Evicted results
+    are not lost for good — an identical request reloads from the SQLite
+    cache; only the exact coverage_id (used by the export buttons) expires.
+    """
+    if len(coverage_storage) <= MAX_COVERAGE_RESULTS:
+        return
+    evictable = [cid for cid, entry in coverage_storage.items()
+                 if entry.get('status') != 'processing']
+    # Oldest first
+    evictable.sort(key=lambda cid: coverage_storage[cid].get('created_at', ''))
+    excess = len(coverage_storage) - MAX_COVERAGE_RESULTS
+    for cid in evictable[:excess]:
+        coverage_storage.pop(cid, None)
+
 # Security: Admin API key for cache management
 # In production, load this from environment variable or secure config
 ADMIN_API_KEY = os.getenv('ADMIN_API_KEY', secrets.token_urlsafe(32))
@@ -162,7 +189,9 @@ security = HTTPBearer()
 
 def verify_admin_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify admin API key for protected endpoints."""
-    if credentials.credentials != ADMIN_API_KEY:
+    # compare_digest is constant-time, preventing timing side channels
+    # that a plain != comparison would allow against the key.
+    if not secrets.compare_digest(credentials.credentials, ADMIN_API_KEY):
         raise HTTPException(
             status_code=403,
             detail="Invalid or missing admin API key"
@@ -302,6 +331,7 @@ async def calculate_single_site_coverage(request: SingleSiteRequest):
             'type': 'single_site',
             'request': request.dict()
         }
+        prune_coverage_storage()
         
         # Start background calculation
         asyncio.create_task(
@@ -470,10 +500,12 @@ async def calculate_multi_site_coverage(request: MultiSiteRequest):
         
         # Store coverage data
         coverage_storage[coverage_id] = {
+            'status': 'complete',
             'coverage_data': coverage_data,
             'created_at': datetime.now().isoformat(),
             'type': 'multi_site'
         }
+        prune_coverage_storage()
         
         return CoverageResponse(
             coverage_id=coverage_id,
