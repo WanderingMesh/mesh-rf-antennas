@@ -114,7 +114,7 @@ class CoverageResponse(BaseModel):
 app = FastAPI(
     title="Longley-Rice RF Coverage Web Application",
     description="Production-ready RF coverage mapping using SPLAT! compatible Longley-Rice model",
-    version="1.0.0",
+    version="0.20.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
