@@ -42,33 +42,39 @@ SIGNAL_COLORS = [
 ]
 
 
-def _signal_to_color(dbm: float) -> tuple:
-    """Map a signal strength value to an RGB color using the SPLAT! color scale."""
-    for threshold, color in SIGNAL_COLORS:
-        if dbm >= threshold:
-            return color
-    return SIGNAL_COLORS[-1][1]
-
-
 def _build_coverage_png(coverage_mask, signal_strength) -> bytes:
     """
     Render coverage data as a transparent PNG for embedding in KMZ.
     Non-coverage areas are fully transparent; coverage areas are colored
     by signal strength using the SPLAT! color scale.
+
+    Fully vectorized: np.searchsorted maps every pixel to its color band
+    at once instead of looping per pixel, which matters for the large
+    rasters SPLAT! produces.
     """
-    height = len(coverage_mask)
-    width = len(coverage_mask[0])
+    mask = np.asarray(coverage_mask, dtype=bool)
+    sig = np.asarray(signal_strength, dtype=np.float64)
+    height, width = mask.shape
 
-    img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-    pixels = img.load()
+    # SIGNAL_COLORS is ordered strongest (0 dBm) to weakest (-150 dBm).
+    # Build ascending threshold arrays for searchsorted; each pixel gets
+    # the color of the first (strongest) band whose threshold it meets.
+    thresholds_desc = np.array([t for t, _ in SIGNAL_COLORS], dtype=np.float64)
+    colors_desc = np.array([c for _, c in SIGNAL_COLORS], dtype=np.uint8)
+    thresholds_asc = thresholds_desc[::-1]
 
-    for row in range(height):
-        for col in range(width):
-            if coverage_mask[row][col]:
-                dbm = signal_strength[row][col]
-                r, g, b = _signal_to_color(dbm)
-                pixels[col, row] = (r, g, b, 180)
+    # Index of the largest threshold <= dbm; below -150 dBm clamps to the
+    # weakest color.
+    idx_asc = np.clip(np.searchsorted(thresholds_asc, sig, side='right') - 1, 0, len(SIGNAL_COLORS) - 1)
+    idx_desc = (len(SIGNAL_COLORS) - 1) - idx_asc
 
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    rgba[..., :3] = colors_desc[idx_desc]
+    rgba[..., 3] = np.where(mask, 180, 0)
+    # Zero out RGB where transparent to keep the PNG clean
+    rgba[~mask, :3] = 0
+
+    img = Image.fromarray(rgba, 'RGBA')
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     return buf.getvalue()
@@ -148,14 +154,10 @@ def export_kmz(coverage_data: Dict, site_name: str = 'Coverage') -> bytes:
     Returns:
         KMZ file contents as bytes
     """
+    # _build_coverage_png accepts ndarrays or nested lists (it normalizes
+    # via np.asarray), so no list conversion is needed here.
     coverage_mask = coverage_data['coverage_mask']
     signal_strength = coverage_data['signal_strength']
-
-    # Convert numpy arrays to lists if needed
-    if isinstance(coverage_mask, np.ndarray):
-        coverage_mask = coverage_mask.tolist()
-    if isinstance(signal_strength, np.ndarray):
-        signal_strength = signal_strength.tolist()
 
     png_filename = 'coverage.png'
     png_bytes = _build_coverage_png(coverage_mask, signal_strength)

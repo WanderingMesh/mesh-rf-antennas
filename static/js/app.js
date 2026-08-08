@@ -1116,44 +1116,6 @@ class CoverageApp {
         if (!icon) return;
         icon.className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
     }
-    
-    addSignalStrengthLegend() {
-        /**
-         * Add a legend showing signal strength color scale.
-         */
-        // Remove existing legend if present
-        if (this.legend) {
-            this.map.removeControl(this.legend);
-        }
-        
-        // Create legend control
-        this.legend = L.control({ position: 'bottomright' });
-        
-        this.legend.onAdd = function() {
-            const div = L.DomUtil.create('div', 'signal-legend');
-            div.innerHTML = `
-                <h4>Signal Strength</h4>
-                <div class="legend-scale">
-                    <div class="legend-item">
-                        <span class="legend-color" style="background: rgb(0, 255, 0);"></span>
-                        <span class="legend-label">Strong (-50 dBm)</span>
-                    </div>
-                    <div class="legend-item">
-                        <span class="legend-color" style="background: rgb(255, 255, 0);"></span>
-                        <span class="legend-label">Medium (-75 dBm)</span>
-                    </div>
-                    <div class="legend-item">
-                        <span class="legend-color" style="background: rgb(255, 0, 0);"></span>
-                        <span class="legend-label">Weak (-100 dBm)</span>
-                    </div>
-                </div>
-                <p class="legend-note">Coverage shows realistic terrain blocking</p>
-            `;
-            return div;
-        };
-        
-        this.legend.addTo(this.map);
-    }
 }
 
 // Initialize the application when the page loads

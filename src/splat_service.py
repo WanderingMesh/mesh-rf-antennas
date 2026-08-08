@@ -370,83 +370,6 @@ class SplatService:
                 
                 return compressed
     
-    def _extract_hgt_from_geotiff(self, tif_data: bytes, lat: int, lon: int, tile_name: str) -> bytes:
-        """Extract a 1x1 degree HGT tile from a 5x5 degree GeoTIFF"""
-        import rasterio
-        from rasterio.io import MemoryFile
-        import struct
-        
-        with MemoryFile(tif_data) as memfile:
-            with memfile.open() as src:
-                print(f"  GeoTIFF bounds: {src.bounds}")
-                print(f"  GeoTIFF shape: {src.shape}")
-                print(f"  GeoTIFF CRS: {src.crs}")
-                
-                # Calculate window for our 1x1 degree tile
-                # lat, lon are the SW corner of the desired tile
-                window = rasterio.windows.from_bounds(
-                    lon, lat, lon + 1, lat + 1,
-                    src.transform
-                )
-                
-                # Read the data for this window
-                data = src.read(1, window=window)
-                print(f"  Extracted tile shape: {data.shape}")
-                
-                # Check if tile is outside bounds
-                if data.shape[0] == 0 or data.shape[1] == 0:
-                    print(f"  Tile {tile_name} is outside GeoTIFF bounds, filling with NODATA")
-                    data = np.full((1201, 1201), -32768, dtype=np.int16)  # NODATA value
-                else:
-                    # Resample to 1201x1201 for SRTM3 format using rasterio's resampling
-                    # which preserves elevation values better than scipy zoom
-                    if data.shape != (1201, 1201):
-                        from rasterio.enums import Resampling
-                        from rasterio.warp import reproject
-                        
-                        # Create output array
-                        resampled = np.empty((1201, 1201), dtype=data.dtype)
-                        
-                        # Calculate transforms
-                        src_transform = rasterio.transform.from_bounds(
-                            lon, lat, lon + 1, lat + 1, data.shape[1], data.shape[0]
-                        )
-                        dst_transform = rasterio.transform.from_bounds(
-                            lon, lat, lon + 1, lat + 1, 1201, 1201
-                        )
-                        
-                        # Reproject with cubic resampling for better elevation preservation
-                        reproject(
-                            source=data,
-                            destination=resampled,
-                            src_transform=src_transform,
-                            dst_transform=dst_transform,
-                            src_crs='EPSG:4326',
-                            dst_crs='EPSG:4326',
-                            resampling=Resampling.cubic
-                        )
-                        
-                        data = resampled
-                        print(f"  Resampled to: {data.shape}")
-                
-                # Convert to HGT format (big-endian 16-bit signed integers)
-                # HGT format: rows from north to south, columns from west to east
-                hgt_data = bytearray()
-                for row in data:
-                    for val in row:
-                        # Clamp to int16 range and convert
-                        val = int(max(-32768, min(32767, val)))
-                        hgt_data.extend(struct.pack('>h', val))
-                
-                print(f"  Created HGT file: {len(hgt_data)} bytes")
-                
-                # Compress with gzip to match expected .hgt.gz format
-                import gzip
-                compressed = gzip.compress(bytes(hgt_data))
-                print(f"  Compressed to: {len(compressed)} bytes")
-                
-                return compressed
-    
     def _create_qth_file(self, path: Path, name: str, lat: float, lon: float, elev: float):
         """Create SPLAT! QTH (site) file"""
         # SPLAT! uses west longitude as positive
@@ -754,39 +677,49 @@ class SplatService:
             MAX_COLOR_DIST_SQ = 15000
             
             # Pre-compute color array for vectorized distance calculation
-            splat_rgb = np.array([(cr, cg, cb) for cr, cg, cb, _ in splat_colors], dtype=np.float64)
+            splat_rgb = np.array([(cr, cg, cb) for cr, cg, cb, _ in splat_colors], dtype=np.float32)
             splat_dbm = np.array([dbm for _, _, _, dbm in splat_colors], dtype=np.float64)
             
             signal_strength = np.full(img_array.shape[:2], -200.0)
             
+            # Vectorized color -> dBm mapping over covered pixels only.
+            # The previous per-pixel Python loop took minutes on large
+            # SPLAT! outputs; NumPy broadcasting does the same work in
+            # well under a second. Processing happens in chunks so the
+            # (N_pixels x N_colors) distance matrix stays memory-bounded.
+            cov_rows, cov_cols = np.nonzero(coverage_mask)
             rejected_pixels = 0
-            for row in range(img_array.shape[0]):
-                for col in range(img_array.shape[1]):
-                    if coverage_mask[row, col]:
-                        px = np.array([int(r[row, col]), int(g[row, col]), int(b[row, col])], dtype=np.float64)
-                        
-                        dists = np.sum((splat_rgb - px) ** 2, axis=1)
-                        i1 = int(np.argmin(dists))
-                        d1 = dists[i1]
-                        
-                        if d1 > MAX_COLOR_DIST_SQ:
-                            coverage_mask[row, col] = False
-                            rejected_pixels += 1
-                            continue
-                        
-                        if d1 == 0:
-                            signal_strength[row, col] = splat_dbm[i1]
-                        else:
-                            # With smooth contours (-s), SPLAT! interpolates
-                            # colors between adjacent bands.  Recover the
-                            # actual dBm by inverse-distance weighting the
-                            # two closest reference colors.
-                            dists[i1] = np.inf
-                            i2 = int(np.argmin(dists))
-                            d2 = dists[i2]
-                            w1 = 1.0 / max(d1, 1e-9)
-                            w2 = 1.0 / max(d2, 1e-9)
-                            signal_strength[row, col] = (splat_dbm[i1] * w1 + splat_dbm[i2] * w2) / (w1 + w2)
+            CHUNK = 500_000
+            for start in range(0, cov_rows.size, CHUNK):
+                rows_c = cov_rows[start:start + CHUNK]
+                cols_c = cov_cols[start:start + CHUNK]
+                px = img_array[rows_c, cols_c, :3].astype(np.float32)
+                
+                # Squared RGB distance from each pixel to each reference color
+                dists = ((px[:, None, :] - splat_rgb[None, :, :]) ** 2).sum(axis=2)
+                i1 = np.argmin(dists, axis=1)
+                d1 = dists[np.arange(i1.size), i1]
+                
+                # Reject anything too far from every SPLAT! signal color
+                # (terrain bleed, rendering artifacts, etc.)
+                invalid = d1 > MAX_COLOR_DIST_SQ
+                rejected_pixels += int(invalid.sum())
+                coverage_mask[rows_c[invalid], cols_c[invalid]] = False
+                
+                # With smooth contours (-sc), SPLAT! interpolates colors
+                # between adjacent bands. Recover the actual dBm by
+                # inverse-distance weighting the two closest reference
+                # colors; exact matches take the band value directly.
+                dists[np.arange(i1.size), i1] = np.inf
+                i2 = np.argmin(dists, axis=1)
+                d2 = dists[np.arange(i2.size), i2]
+                w1 = 1.0 / np.maximum(d1, 1e-9)
+                w2 = 1.0 / np.maximum(d2, 1e-9)
+                interp = (splat_dbm[i1] * w1 + splat_dbm[i2] * w2) / (w1 + w2)
+                values = np.where(d1 == 0, splat_dbm[i1], interp)
+                
+                valid = ~invalid
+                signal_strength[rows_c[valid], cols_c[valid]] = values[valid]
             
             if rejected_pixels > 0:
                 print(f"Rejected {rejected_pixels} pixels with unrecognized colors")
@@ -850,27 +783,25 @@ class SplatService:
             # Update bounds to the cropped region
             west, east, south, north = new_west, new_east, new_south, new_north
             
-            # Now mask by actual distance (circular, not square crop)
+            # Now mask by actual distance (circular, not square crop).
+            # Vectorized haversine over the whole grid — the previous
+            # per-pixel Python loop dominated post-processing time.
             height, width = coverage_mask.shape
-            tx_row_cropped = tx_row - row_min
-            tx_col_cropped = tx_col - col_min
             
-            for row in range(height):
-                for col in range(width):
-                    # Convert pixel to lat/lon
-                    pixel_lon = west + (col / width) * (east - west)
-                    pixel_lat = north - (row / height) * (north - south)
-                    
-                    # Haversine distance
-                    dlat = math.radians(pixel_lat - tx_lat)
-                    dlon = math.radians(pixel_lon - tx_lon)
-                    a = math.sin(dlat/2)**2 + math.cos(math.radians(tx_lat)) * math.cos(math.radians(pixel_lat)) * math.sin(dlon/2)**2
-                    c = 2 * math.asin(math.sqrt(a))
-                    distance_km = 6371 * c
-                    
-                    if distance_km > analysis_radius_km:
-                        coverage_mask[row, col] = False
-                        signal_strength[row, col] = -200.0
+            pixel_lats = np.radians(north - (np.arange(height) / height) * (north - south))
+            pixel_lons = np.radians(west + (np.arange(width) / width) * (east - west))
+            tx_lat_rad = math.radians(tx_lat)
+            tx_lon_rad = math.radians(tx_lon)
+            
+            dlat = pixel_lats[:, None] - tx_lat_rad          # (H, 1)
+            dlon = pixel_lons[None, :] - tx_lon_rad          # (1, W)
+            a = (np.sin(dlat / 2) ** 2
+                 + math.cos(tx_lat_rad) * np.cos(pixel_lats)[:, None] * np.sin(dlon / 2) ** 2)
+            distance_km = 6371 * 2 * np.arcsin(np.sqrt(a))   # (H, W) via broadcasting
+            
+            outside = distance_km > analysis_radius_km
+            coverage_mask[outside] = False
+            signal_strength[outside] = -200.0
             
             print(f"Masked coverage beyond {analysis_radius_km} km radius")
         
