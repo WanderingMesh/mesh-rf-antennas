@@ -1,0 +1,36 @@
+# Project Intelligence — mesh-rf-antennas
+
+## Critical implementation paths
+- SPLAT! must run with -L (ITM propagation), NEVER -c (LOS-only ignores all RF params).
+- QTH files: west longitude is POSITIVE for SPLAT!; elevation line needs explicit "meters".
+- Antenna .az/.el files must share the QTH/LRP base filename (lowercase "tx");
+  .az line 1 is the rotation angle, pattern written unrotated (LoadPAT rotates).
+- Per-request config: ALWAYS copy.deepcopy(config) — shallow copies mutate global defaults.
+- Static API routes (e.g. /api/cache/clear) must be declared BEFORE parameterized
+  siblings (/api/cache/{site_key}) — FastAPI matches in declaration order.
+- Synchronous work in async handlers (SPLAT! subprocess, pickle/SQLite blobs)
+  goes through asyncio.to_thread or the /status polling endpoint freezes.
+- rasterio rowcol() returns (row, col) — a swap bug existed here; test_app.py asserts order.
+
+## Workflow
+- Dev environment: conda env `mesh_map3` (/opt/homebrew/anaconda3/envs/mesh_map3).
+  System python3 lacks the dependencies.
+- Tests: pytest test_app.py only. test_antenna_pattern.py and diagnose*.py are
+  manual scripts — collecting test_antenna_pattern.py runs a full SPLAT! calc.
+- Branching: version-named dev branches (dev/0.20.0); main stays stable.
+  Keep app.py FastAPI version= in sync with the branch version.
+- SPLAT! binaries are per-machine: ./build_splat.sh after clone.
+
+## User preferences
+- Functional, well-commented code; comments explain WHY.
+- Never commit regenerable caches (coverage_db/, splat_cache/, dem_cache/, output/).
+- Do not put *.md in .gitignore (it silently excluded README.md once).
+- Avoid OneDrive-synced paths for repos with SQLite files.
+
+## Known gotchas
+- The OneDrive copy (mesh_mapper3_directional) is a diverged sibling with a
+  KMZ/GeoTIFF import feature not yet ported here; its git repo has a 1.5 GB
+  DB staged — never push from it.
+- elevation library needs GDAL on PATH; splat_service injects the interpreter
+  bin dir before calling it. On download failure, elevation.clean() must run
+  or stale empty tiles break subsequent downloads.
