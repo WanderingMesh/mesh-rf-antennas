@@ -9,6 +9,11 @@ pushed with a PR open against `main`.
 
 ## Next steps (not yet done)
 
+0. Owner is field-testing the per-SF LoRa link budget (commit 23877d0,
+   running on port 8011). Remaining accuracy roadmap if they continue:
+   NLCD clutter-loss layer, field-measurement calibration mode, and
+   possibly ITU-R P.1812 as the propagation engine (see the 2026-08-10
+   chat assessment: ITM ignores clutter and underestimates LoRa range).
 1. Review and merge the `dev/0.20.0` PR when the owner is ready.
 2. Consider multi-site improvements: it still uses the pure-Python
    fallback engine (not SplatService), ignores antenna direction, and has
