@@ -93,7 +93,45 @@
                         </div>
                     </div>
                     <div class="form-group">
-                        <label for="rxSensitivity">RX Sensitivity (dBm):</label>
+                        <label for="radioPreset">LoRa Firmware Preset:</label>
+                        <select id="radioPreset">
+                            <option value="">— None (manual radio settings) —</option>
+                        </select>
+                        <small>Sets bandwidth/SF (and frequency where the preset defines one)</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="radioChipset">Radio Chipset:</label>
+                        <select id="radioChipset">
+                            <option value="manual" selected>Manual (enter RX sensitivity below)</option>
+                        </select>
+                        <small>RX sensitivity auto-derived from the chipset datasheet per SF/BW</small>
+                    </div>
+                    <div class="form-group" id="sfGroup" style="display: none;">
+                        <label for="spreadingFactor">Spreading Factor:</label>
+                        <select id="spreadingFactor">
+                            <option value="7">SF7 (fastest, shortest range)</option>
+                            <option value="8">SF8</option>
+                            <option value="9">SF9</option>
+                            <option value="10">SF10</option>
+                            <option value="11">SF11</option>
+                            <option value="12">SF12 (slowest, longest range)</option>
+                        </select>
+                    </div>
+                    <div class="form-group" id="bwGroup" style="display: none;">
+                        <label for="bandwidth">Bandwidth (kHz):</label>
+                        <select id="bandwidth">
+                            <option value="62.5">62.5 (MeshCore US current)</option>
+                            <option value="125">125 (LoRaWAN standard)</option>
+                            <option value="250" selected>250 (Meshtastic default)</option>
+                            <option value="500">500</option>
+                        </select>
+                        <small>Narrower bandwidth = better sensitivity (~3 dB per halving)</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="rxSensitivity">
+                            RX Sensitivity (dBm):
+                            <span id="sensitivityAutoFillIndicator" style="font-size: 0.85em; color: var(--text-muted); font-weight: normal;"></span>
+                        </label>
                         <input type="number" id="rxSensitivity" value="-100" min="-150" max="-50" step="0.1">
                     </div>
                     <div class="form-group">
@@ -133,7 +171,11 @@
                             <input type="range" id="fractionOfTime" value="0.50" min="0.10" max="0.90" step="0.05" style="flex: 1;">
                             <span id="fractionOfTimeValue" style="font-weight: bold; width: 50px; text-align: center;">50%</span>
                         </div>
-                        <small>Lower % = more optimistic (best-case), Higher % = more conservative (worst-case)</small>
+                        <small>ITM "fraction of time": the map shows where the signal meets your
+                        sensitivity for this percentage of the time. 50% = median/typical conditions
+                        (good for comparing sites); 90% = signal holds ~9 days out of 10 (use this
+                        to plan mesh links you rely on). Expect noticeably smaller — but honest —
+                        coverage at 90%.</small>
                     </div>
                 </div>
 
