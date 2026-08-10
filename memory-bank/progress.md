@@ -1,12 +1,18 @@
 # Progress
 
-## Status: dev/0.20.0 complete through the review-fix pass (2026-08-07)
+## Status: dev/0.20.0 feature-complete, smoke-tested, PR open (2026-08-10)
 
 ## What works
 
 - Single-site coverage end-to-end with SPLAT! binary, directional
   antennas, caching, heat-map rendering, KMZ/GeoTIFF export
+- KMZ/GeoTIFF IMPORT (`POST /api/coverage/import` + Import Layer UI):
+  re-load previously exported layers; GeoTIFF round trip is lossless,
+  KMZ round trip is 10 dB-band lossy by design
 - Test suite: 4/4 passing (`pytest test_app.py` in mesh_map3 env)
+- Live end-to-end smoke test: 16/16 checks passing against a real
+  server + SPLAT! binary + SRTM terrain (smoke_test.py; method
+  documented in memory-bank/testing.md)
 - Vectorized post-processing verified pixel-exact against the original
   per-pixel loops
 
@@ -35,12 +41,12 @@
    radius mask, KMZ PNG builder; deleted src/longley_rice.py,
    _create_fallback_dem, _extract_hgt_from_geotiff, addSignalStrengthLegend,
    aiofiles import; pruned requirements.txt; fixed 2 stale tests
+6. `862e752` Ported KMZ/GeoTIFF import feature (endpoint, import_kmz with
+   vectorized reverse color mapping, import_geotiff, frontend UI)
+7. Smoke test + from_cache serialization fix (GET /api/coverage/{id} and
+   /status now report whether a result came from the SQLite cache)
 
 ## What's left / known issues
-
-- Branch not pushed; no PR yet
-- KMZ/GeoTIFF IMPORT feature exists only in the OneDrive copy — port it
-  (see activeContext.md item 3)
 - Multi-site path: pure-Python engine only, no antenna patterns, no
   progress, no caching, synchronous per-site loop
 - Pickle used for cache blobs (unsafe if DB tampered)

@@ -533,7 +533,10 @@ async def get_coverage_status(coverage_id: str):
         'progress_message': stored_data.get('progress_message', ''),
         'created_at': stored_data.get('created_at'),
         'completed_at': stored_data.get('completed_at'),
-        'error': stored_data.get('error')
+        'error': stored_data.get('error'),
+        # Surface whether the result came from the SQLite cache; the flag was
+        # previously stored internally but never serialized to clients.
+        'from_cache': stored_data.get('from_cache', False)
     }
 
 
@@ -582,7 +585,8 @@ async def get_coverage_data(coverage_id: str):
         'dem_transform': coverage_data.get('dem_transform'),
         'statistics': coverage_data.get('statistics'),
         'created_at': stored_data.get('created_at'),
-        'type': stored_data.get('type')
+        'type': stored_data.get('type'),
+        'from_cache': stored_data.get('from_cache', False)
     }
     
     return serializable_data
