@@ -91,6 +91,11 @@ class CoverageApp {
             this.calculateMultiSite();
         });
         
+        // Import layer button
+        document.getElementById('importLayer').addEventListener('click', () => {
+            this.importLayer();
+        });
+        
         // Clear map button
         document.getElementById('clearMap').addEventListener('click', () => {
             this.clearCoverageLayers();
@@ -543,6 +548,48 @@ class CoverageApp {
             this.showError(`Error: ${error.message}`);
         } finally {
             this.isCalculating = false;
+            this.showLoading(false);
+        }
+    }
+    
+    async importLayer() {
+        const fileInput = document.getElementById('importFile');
+        if (!fileInput.files[0]) {
+            this.showError('Please select a KMZ or GeoTIFF file to import');
+            return;
+        }
+        
+        this.showLoading(true);
+        this.updateStatus('Importing coverage layer...');
+        
+        try {
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            
+            const response = await fetch('/api/coverage/import', {
+                method: 'POST',
+                body: formData
+            });
+            
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || 'Import failed');
+            }
+            
+            const coverageData = await response.json();
+            const coverageId = coverageData.coverage_id;
+            
+            await this.addCoverageToMap(coverageData, coverageId);
+            
+            const siteName = coverageData.site_name || 'Imported';
+            this.showSuccess(`Imported coverage layer: ${siteName}`);
+            
+            // Reset the file input so the same file can be re-imported
+            fileInput.value = '';
+            
+        } catch (error) {
+            this.showError(`Import error: ${error.message}`);
+        } finally {
             this.showLoading(false);
         }
     }

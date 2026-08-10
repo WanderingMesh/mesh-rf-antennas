@@ -54,7 +54,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 from src.coverage_calculator import CoverageCalculator
-from src.export_service import export_kmz, export_geotiff
+from src.export_service import export_kmz, export_geotiff, import_kmz, import_geotiff
 from config import get_config, validate_config
 
 # ============================================================================
@@ -641,6 +641,68 @@ async def export_coverage_geotiff(coverage_id: str):
     
     safe_name = site_name.replace(' ', '_').replace('/', '_')
     return _binary_response(tiff_bytes, f'{safe_name}_coverage.tif', 'image/tiff')
+
+
+@app.post("/api/coverage/import")
+async def import_coverage_layer(file: UploadFile = File(...)):
+    """
+    Import a previously-exported KMZ or GeoTIFF coverage layer.
+
+    The file is parsed to recover coverage_mask, signal_strength, geographic
+    bounds, and site metadata. The result is stored in memory and returned
+    in the same format as a freshly-calculated coverage layer so the
+    frontend can render it with no special handling.
+    """
+    filename = (file.filename or '').lower()
+    raw = await file.read()
+
+    if filename.endswith('.kmz'):
+        try:
+            # Threaded: pixel reverse-mapping on large overlays is CPU work
+            coverage_data = await asyncio.to_thread(import_kmz, raw)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"KMZ import failed: {e}")
+    elif filename.endswith(('.tif', '.tiff', '.geotiff')):
+        try:
+            coverage_data = await asyncio.to_thread(import_geotiff, raw)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"GeoTIFF import failed: {e}")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Upload a .kmz or .tif/.tiff file."
+        )
+
+    coverage_id = str(uuid.uuid4())
+    coverage_storage[coverage_id] = {
+        'status': 'complete',
+        'coverage_data': coverage_data,
+        'created_at': datetime.now().isoformat(),
+        'completed_at': datetime.now().isoformat(),
+        'type': 'imported',
+        'from_cache': False,
+    }
+    prune_coverage_storage()
+
+    # Return the same shape the frontend expects from /api/coverage/{id}
+    return {
+        'status': 'complete',
+        'coverage_id': coverage_id,
+        'coverage_mask': coverage_data['coverage_mask'],
+        'signal_strength': coverage_data['signal_strength'],
+        'tx_lat': coverage_data.get('tx_lat'),
+        'tx_lon': coverage_data.get('tx_lon'),
+        'tx_elev_m': coverage_data.get('tx_elev_m'),
+        'frequency_mhz': coverage_data.get('frequency_mhz'),
+        'tx_power_dbm': coverage_data.get('tx_power_dbm'),
+        'antenna_gain_dbi': coverage_data.get('antenna_gain_dbi'),
+        'antenna_type': coverage_data.get('antenna_type'),
+        'antenna_azimuth': coverage_data.get('antenna_azimuth'),
+        'antenna_tilt': coverage_data.get('antenna_tilt'),
+        'antenna_tilt_azimuth': coverage_data.get('antenna_tilt_azimuth'),
+        'site_name': coverage_data.get('site_name'),
+        'dem_bounds': coverage_data.get('dem_bounds'),
+    }
 
 
 def _binary_response(data: bytes, filename: str, media_type: str):

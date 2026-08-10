@@ -180,6 +180,14 @@
 
                 <div class="panel-section">
                     <h3><i class="fas fa-map"></i> Map Controls</h3>
+                    <div class="form-group">
+                        <label for="importFile">Import Coverage Layer:</label>
+                        <input type="file" id="importFile" accept=".kmz,.tif,.tiff,.geotiff">
+                        <small>Load a previously-exported KMZ or GeoTIFF</small>
+                    </div>
+                    <button id="importLayer" class="btn btn-primary" style="margin-bottom: 0.75rem;">
+                        <i class="fas fa-file-import"></i> Import Layer
+                    </button>
                     <button id="clearMap" class="btn btn-warning">
                         <i class="fas fa-eraser"></i> Clear All Coverage
                     </button>
