@@ -122,29 +122,6 @@ class DEMHandler:
             print("CRITICAL: Cannot proceed without terrain data!")
             raise RuntimeError(f"Failed to download terrain data: {e}")
     
-    def _create_fallback_dem(self, bounds: Tuple[float, float, float, float]) -> Tuple[np.ndarray, rasterio.transform.Affine]:
-        """Create a fallback flat DEM when download fails."""
-        west, south, east, north = bounds
-        
-        # Create a simple flat terrain
-        # Calculate approximate pixel size
-        lat_span = north - south
-        lon_span = east - west
-        
-        # Estimate pixel dimensions
-        pixels_per_degree = 111320 / self.resolution  # Approximate
-        height = int(lat_span * pixels_per_degree)
-        width = int(lon_span * pixels_per_degree)
-        
-        # Create flat terrain at 100m elevation
-        dem_data = np.full((height, width), 100.0, dtype=np.float32)
-        
-        # Create transform
-        transform = from_bounds(west, south, east, north, width, height)
-        
-        print("Using fallback flat terrain (100m elevation)")
-        return dem_data, transform
-    
     def latlon_to_pixel(self, lat: float, lon: float, transform: rasterio.transform.Affine) -> Tuple[int, int]:
         """
         Convert latitude/longitude to pixel coordinates.
@@ -157,7 +134,10 @@ class DEMHandler:
         Returns:
             Tuple of (row, col) pixel coordinates
         """
-        col, row = rasterio.transform.rowcol(transform, lon, lat)
+        # rasterio.transform.rowcol returns (row, col) — the previous code
+        # unpacked it as (col, row), silently transposing every coordinate
+        # lookup in the Python-fallback terrain profile path.
+        row, col = rasterio.transform.rowcol(transform, lon, lat)
         return row, col
     
     def pixel_to_latlon(self, row: int, col: int, transform: rasterio.transform.Affine) -> Tuple[float, float]:

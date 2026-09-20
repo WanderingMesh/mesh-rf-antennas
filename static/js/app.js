@@ -91,6 +91,11 @@ class CoverageApp {
             this.calculateMultiSite();
         });
         
+        // Import layer button
+        document.getElementById('importLayer').addEventListener('click', () => {
+            this.importLayer();
+        });
+        
         // Clear map button
         document.getElementById('clearMap').addEventListener('click', () => {
             this.clearCoverageLayers();
@@ -543,6 +548,48 @@ class CoverageApp {
             this.showError(`Error: ${error.message}`);
         } finally {
             this.isCalculating = false;
+            this.showLoading(false);
+        }
+    }
+    
+    async importLayer() {
+        const fileInput = document.getElementById('importFile');
+        if (!fileInput.files[0]) {
+            this.showError('Please select a KMZ or GeoTIFF file to import');
+            return;
+        }
+        
+        this.showLoading(true);
+        this.updateStatus('Importing coverage layer...');
+        
+        try {
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            
+            const response = await fetch('/api/coverage/import', {
+                method: 'POST',
+                body: formData
+            });
+            
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || 'Import failed');
+            }
+            
+            const coverageData = await response.json();
+            const coverageId = coverageData.coverage_id;
+            
+            await this.addCoverageToMap(coverageData, coverageId);
+            
+            const siteName = coverageData.site_name || 'Imported';
+            this.showSuccess(`Imported coverage layer: ${siteName}`);
+            
+            // Reset the file input so the same file can be re-imported
+            fileInput.value = '';
+            
+        } catch (error) {
+            this.showError(`Import error: ${error.message}`);
+        } finally {
             this.showLoading(false);
         }
     }
@@ -1115,44 +1162,6 @@ class CoverageApp {
         const icon = document.getElementById('themeIcon');
         if (!icon) return;
         icon.className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
-    }
-    
-    addSignalStrengthLegend() {
-        /**
-         * Add a legend showing signal strength color scale.
-         */
-        // Remove existing legend if present
-        if (this.legend) {
-            this.map.removeControl(this.legend);
-        }
-        
-        // Create legend control
-        this.legend = L.control({ position: 'bottomright' });
-        
-        this.legend.onAdd = function() {
-            const div = L.DomUtil.create('div', 'signal-legend');
-            div.innerHTML = `
-                <h4>Signal Strength</h4>
-                <div class="legend-scale">
-                    <div class="legend-item">
-                        <span class="legend-color" style="background: rgb(0, 255, 0);"></span>
-                        <span class="legend-label">Strong (-50 dBm)</span>
-                    </div>
-                    <div class="legend-item">
-                        <span class="legend-color" style="background: rgb(255, 255, 0);"></span>
-                        <span class="legend-label">Medium (-75 dBm)</span>
-                    </div>
-                    <div class="legend-item">
-                        <span class="legend-color" style="background: rgb(255, 0, 0);"></span>
-                        <span class="legend-label">Weak (-100 dBm)</span>
-                    </div>
-                </div>
-                <p class="legend-note">Coverage shows realistic terrain blocking</p>
-            `;
-            return div;
-        };
-        
-        this.legend.addTo(this.map);
     }
 }
 

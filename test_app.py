@@ -55,10 +55,18 @@ def test_dem_handler():
     bounds = create_dem_bounds(39.5296, -119.8138, 10.0)  # 10km radius around Reno
     print(f"DEM bounds: {bounds}")
     
-    # Test coordinate conversion
+    # Test coordinate conversion. rasterio requires a real Affine
+    # transform — a bare tuple is misinterpreted as GCPs and raises.
+    from rasterio.transform import Affine
+    transform = Affine(0.001, 0, -120, 0, -0.001, 40)
     lat, lon = 39.5296, -119.8138
-    row, col = dem_handler.latlon_to_pixel(lat, lon, (0.001, 0, -120, 0, -0.001, 40))
+    row, col = dem_handler.latlon_to_pixel(lat, lon, transform)
     print(f"Pixel coordinates for ({lat}, {lon}): ({row}, {col})")
+    
+    # With this transform: col = (lon - west) / 0.001, row = (north - lat) / 0.001.
+    # This also guards against the historical bug where row/col came back swapped.
+    assert row == int((40 - lat) / 0.001), f"row {row} is wrong — row/col may be swapped"
+    assert col == int((lon - (-120)) / 0.001), f"col {col} is wrong — row/col may be swapped"
     
     print("✓ DEM handler test passed\n")
 
@@ -85,9 +93,17 @@ def test_coverage_calculation():
         pixel_size_km=0.1
     )
     
-    print(f"Coverage mask shape: {coverage_data['coverage_mask'].shape}")
-    print(f"Coverage pixels: {np.sum(coverage_data['coverage_mask'])}")
-    print(f"Signal strength range: {coverage_data['signal_strength'].min():.1f} to {coverage_data['signal_strength'].max():.1f} dBm")
+    # calculate_splat_coverage_map returns JSON-friendly nested lists;
+    # convert back to arrays the same way coverage_calculator.py does.
+    coverage_mask = np.array(coverage_data['coverage_mask'], dtype=bool)
+    signal_strength = np.array(coverage_data['signal_strength'], dtype=np.float32)
+    
+    print(f"Coverage mask shape: {coverage_mask.shape}")
+    print(f"Coverage pixels: {np.sum(coverage_mask)}")
+    print(f"Signal strength range: {signal_strength.min():.1f} to {signal_strength.max():.1f} dBm")
+    
+    assert coverage_mask.shape == dem_data.shape
+    assert signal_strength.shape == dem_data.shape
     
     print("✓ Coverage calculation test passed\n")
 
