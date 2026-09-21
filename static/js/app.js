@@ -18,6 +18,9 @@ class CoverageApp {
     init() {
         this.initMap();
         this.bindEvents();
+        // Chipset sensitivity tables and firmware presets come from the
+        // backend so the UI and the server share one source of truth
+        this.loadRadioOptions();
         this.updateStatus('Ready - Click on map to place a site or upload CSV for multi-site analysis');
     }
     
@@ -94,6 +97,21 @@ class CoverageApp {
         // Import layer button
         document.getElementById('importLayer').addEventListener('click', () => {
             this.importLayer();
+        });
+        
+        // LoRa radio settings: preset fills SF/BW/frequency; chipset/SF/BW
+        // changes recompute the derived RX sensitivity
+        document.getElementById('radioPreset').addEventListener('change', () => {
+            this.applyRadioPreset();
+        });
+        document.getElementById('radioChipset').addEventListener('change', () => {
+            this.updateSensitivityFromRadio();
+        });
+        document.getElementById('spreadingFactor').addEventListener('change', () => {
+            this.updateSensitivityFromRadio();
+        });
+        document.getElementById('bandwidth').addEventListener('change', () => {
+            this.updateSensitivityFromRadio();
         });
         
         // Clear map button
@@ -435,7 +453,8 @@ class CoverageApp {
                 analysis_radius_km: parseFloat(document.getElementById('analysisRadius').value),
                 climate_zone: document.getElementById('climateZone').value,
                 ground_type: document.getElementById('groundType').value,
-                fraction_of_time: parseFloat(document.getElementById('fractionOfTime').value)
+                fraction_of_time: parseFloat(document.getElementById('fractionOfTime').value),
+                ...this.getRadioPayload()
             };
             
             const response = await fetch('/api/coverage/single', {
@@ -510,7 +529,8 @@ class CoverageApp {
                 analysis_radius_km: parseFloat(document.getElementById('analysisRadius').value),
                 climate_zone: document.getElementById('climateZone').value,
                 ground_type: document.getElementById('groundType').value,
-                fraction_of_time: parseFloat(document.getElementById('fractionOfTime').value)
+                fraction_of_time: parseFloat(document.getElementById('fractionOfTime').value),
+                ...this.getRadioPayload()
             };
             
             const response = await fetch('/api/coverage/multi', {
@@ -550,6 +570,138 @@ class CoverageApp {
             this.isCalculating = false;
             this.showLoading(false);
         }
+    }
+    
+    async loadRadioOptions() {
+        /**
+         * Fetch chipset sensitivity tables and firmware presets from the
+         * backend and populate the radio selects. Runs once at startup.
+         */
+        try {
+            const response = await fetch('/api/lora/radios');
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            this.radioOptions = await response.json();
+            
+            const chipsetSelect = document.getElementById('radioChipset');
+            this.radioOptions.chipsets.forEach(chip => {
+                const opt = document.createElement('option');
+                opt.value = chip.id;
+                opt.textContent = chip.label;
+                chipsetSelect.appendChild(opt);
+            });
+            
+            const presetSelect = document.getElementById('radioPreset');
+            this.radioOptions.presets.forEach(preset => {
+                const opt = document.createElement('option');
+                opt.value = preset.id;
+                opt.textContent = preset.label;
+                presetSelect.appendChild(opt);
+            });
+        } catch (error) {
+            // The manual sensitivity field still works without the tables,
+            // so a failed fetch degrades gracefully rather than blocking
+            console.error('Failed to load LoRa radio options:', error);
+        }
+    }
+    
+    applyRadioPreset() {
+        /**
+         * Apply a firmware preset: sets SF and bandwidth, plus frequency
+         * when the preset pins one (MeshCore channel plan, Meshtastic
+         * LongFast US slot). Selects SX1262 if no chipset was chosen yet,
+         * since it is what nearly all current mesh hardware ships with.
+         */
+        const presetId = document.getElementById('radioPreset').value;
+        if (!presetId || !this.radioOptions) return;
+        
+        const preset = this.radioOptions.presets.find(p => p.id === presetId);
+        if (!preset) return;
+        
+        document.getElementById('spreadingFactor').value = String(preset.spreading_factor);
+        document.getElementById('bandwidth').value = String(preset.bandwidth_khz);
+        if (preset.frequency_mhz) {
+            document.getElementById('frequency').value = preset.frequency_mhz;
+        }
+        
+        const chipsetSelect = document.getElementById('radioChipset');
+        if (chipsetSelect.value === 'manual') {
+            chipsetSelect.value = 'sx1262';
+        }
+        this.updateSensitivityFromRadio();
+    }
+    
+    updateSensitivityFromRadio() {
+        /**
+         * Derive RX sensitivity from chipset + SF + BW using the tables
+         * served by the backend, mirroring src/lora_link_budget.py:
+         * sens(bw) = sens(125 kHz) + 10*log10(bw/125).
+         * The backend recomputes this authoritatively on every request;
+         * this display exists so the user sees the link budget they get.
+         */
+        const chipsetId = document.getElementById('radioChipset').value;
+        const sensInput = document.getElementById('rxSensitivity');
+        const indicator = document.getElementById('sensitivityAutoFillIndicator');
+        const sfGroup = document.getElementById('sfGroup');
+        const bwGroup = document.getElementById('bwGroup');
+        
+        if (chipsetId === 'manual') {
+            sfGroup.style.display = 'none';
+            bwGroup.style.display = 'none';
+            sensInput.readOnly = false;
+            indicator.textContent = '';
+            return;
+        }
+        
+        sfGroup.style.display = '';
+        bwGroup.style.display = '';
+        
+        if (!this.radioOptions) return;
+        const chip = this.radioOptions.chipsets.find(c => c.id === chipsetId);
+        if (!chip) return;
+        
+        const sf = parseInt(document.getElementById('spreadingFactor').value, 10);
+        const bw = parseFloat(document.getElementById('bandwidth').value);
+        
+        // Surface chipset limitations (LLCC68) instead of silently
+        // producing a sensitivity the hardware can't achieve
+        if (bw === 62.5 && !chip.supports_62_5khz) {
+            indicator.textContent = '(chipset does not support 62.5 kHz)';
+            sensInput.readOnly = true;
+            return;
+        }
+        if (chip.max_sf_by_bw) {
+            const maxSf = chip.max_sf_by_bw[String(bw)] ?? chip.max_sf_by_bw[bw];
+            if (maxSf !== undefined && sf > maxSf) {
+                indicator.textContent = `(chipset max is SF${maxSf} at ${bw} kHz)`;
+                sensInput.readOnly = true;
+                return;
+            }
+        }
+        
+        const sens125 = chip.sensitivity_125khz[String(sf)] ?? chip.sensitivity_125khz[sf];
+        if (sens125 === undefined) return;
+        
+        const sensitivity = Math.round((sens125 + 10 * Math.log10(bw / 125)) * 10) / 10;
+        sensInput.value = sensitivity;
+        sensInput.readOnly = true;
+        indicator.textContent = '(auto from chipset/SF/BW)';
+    }
+    
+    getRadioPayload() {
+        /**
+         * LoRa radio fields for calculation requests. With a real chipset
+         * the backend derives sensitivity itself; the rx_sensitivity_dbm
+         * we send is just the displayed value and gets overridden.
+         */
+        const chipset = document.getElementById('radioChipset').value;
+        if (chipset === 'manual') {
+            return { radio_chipset: 'manual', spreading_factor: null, bandwidth_khz: null };
+        }
+        return {
+            radio_chipset: chipset,
+            spreading_factor: parseInt(document.getElementById('spreadingFactor').value, 10),
+            bandwidth_khz: parseFloat(document.getElementById('bandwidth').value)
+        };
     }
     
     async importLayer() {

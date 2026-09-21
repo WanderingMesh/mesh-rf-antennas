@@ -55,6 +55,7 @@ import matplotlib.colors as mcolors
 
 from src.coverage_calculator import CoverageCalculator
 from src.export_service import export_kmz, export_geotiff, import_kmz, import_geotiff
+from src.lora_link_budget import resolve_sensitivity, describe_radio_options
 from config import get_config, validate_config
 
 # ============================================================================
@@ -74,11 +75,18 @@ class SingleSiteRequest(BaseModel):
     antenna_azimuth: float = Field(0.0, ge=0, le=360, description="Antenna pointing direction in degrees (0=North, 90=East)")
     antenna_tilt: float = Field(0.0, ge=-10, le=10, description="Antenna tilt in degrees (positive=down, negative=up)")
     antenna_tilt_azimuth: float = Field(0.0, ge=0, le=360, description="Compass direction the antenna tilts toward (0=North, 90=East)")
-    rx_sensitivity_dbm: float = Field(-100.0, ge=-150, le=-50, description="Receiver sensitivity in dBm")
+    rx_sensitivity_dbm: float = Field(-100.0, ge=-150, le=-50, description="Receiver sensitivity in dBm (ignored when radio_chipset is not 'manual')")
     analysis_radius_km: float = Field(50.0, ge=1, le=200, description="Analysis radius in kilometers")
     climate_zone: str = Field("desert", description="ITU climate zone for propagation model")
     ground_type: str = Field("desert", description="Ground type affecting dielectric/conductivity")
     fraction_of_time: float = Field(0.50, ge=0.01, le=0.99, description="Fraction of time reliability (lower = more optimistic)")
+    # LoRa per-SF link budget: when radio_chipset names a real chipset,
+    # spreading_factor and bandwidth_khz are required and rx_sensitivity_dbm
+    # is DERIVED from the datasheet lookup (src/lora_link_budget.py),
+    # replacing whatever the client sent in that field.
+    radio_chipset: str = Field("manual", description="LoRa chipset: manual, sx1262, sx1268, sx1276, llcc68")
+    spreading_factor: Optional[int] = Field(None, ge=7, le=12, description="LoRa spreading factor 7-12 (required unless chipset is 'manual')")
+    bandwidth_khz: Optional[float] = Field(None, description="LoRa bandwidth in kHz: 62.5, 125, 250, or 500 (required unless chipset is 'manual')")
 
 class Site(BaseModel):
     """A single site within a multi-site coverage request.
@@ -103,11 +111,15 @@ class MultiSiteRequest(BaseModel):
     antenna_azimuth: float = Field(0.0, ge=0, le=360, description="Antenna pointing direction in degrees (0=North, 90=East)")
     antenna_tilt: float = Field(0.0, ge=-10, le=10, description="Antenna tilt in degrees (positive=down, negative=up)")
     antenna_tilt_azimuth: float = Field(0.0, ge=0, le=360, description="Compass direction the antenna tilts toward (0=North, 90=East)")
-    rx_sensitivity_dbm: float = Field(-100.0, ge=-150, le=-50, description="Receiver sensitivity in dBm")
+    rx_sensitivity_dbm: float = Field(-100.0, ge=-150, le=-50, description="Receiver sensitivity in dBm (ignored when radio_chipset is not 'manual')")
     analysis_radius_km: float = Field(50.0, ge=1, le=200, description="Analysis radius in kilometers")
     climate_zone: str = Field("desert", description="ITU climate zone for propagation model")
     ground_type: str = Field("desert", description="Ground type affecting dielectric/conductivity")
     fraction_of_time: float = Field(0.50, ge=0.01, le=0.99, description="Fraction of time reliability (lower = more optimistic)")
+    # Same per-SF link budget fields as SingleSiteRequest (see comment there)
+    radio_chipset: str = Field("manual", description="LoRa chipset: manual, sx1262, sx1268, sx1276, llcc68")
+    spreading_factor: Optional[int] = Field(None, ge=7, le=12, description="LoRa spreading factor 7-12 (required unless chipset is 'manual')")
+    bandwidth_khz: Optional[float] = Field(None, description="LoRa bandwidth in kHz: 62.5, 125, 250, or 500 (required unless chipset is 'manual')")
 
 class CoverageResponse(BaseModel):
     """Response model for coverage calculations."""
@@ -312,6 +324,43 @@ async def root(request: Request):
     """Serve the main web interface."""
     return templates.TemplateResponse(request, "index.html")
 
+def _apply_lora_link_budget(request) -> None:
+    """
+    Resolve rx_sensitivity_dbm from the LoRa chipset lookup when requested.
+
+    Mutates the request in place so the derived sensitivity flows into the
+    cache key, the SPLAT! configuration, and the stored request metadata
+    exactly as if the client had typed it. Runs in the HTTP handler (not
+    the background task) so an invalid SF/BW/chipset combination fails
+    fast with a 422 instead of surfacing later as a failed calculation.
+    """
+    if request.radio_chipset == 'manual':
+        return
+    if request.spreading_factor is None or request.bandwidth_khz is None:
+        raise HTTPException(
+            status_code=422,
+            detail="spreading_factor and bandwidth_khz are required when radio_chipset is not 'manual'"
+        )
+    try:
+        request.rx_sensitivity_dbm = resolve_sensitivity(
+            request.radio_chipset, request.spreading_factor, request.bandwidth_khz
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.get("/api/lora/radios")
+async def get_lora_radio_options():
+    """
+    Chipset sensitivity tables and firmware presets for the frontend.
+
+    The UI renders its radio pickers and live sensitivity display from this
+    payload, so the datasheet numbers live in exactly one place
+    (src/lora_link_budget.py).
+    """
+    return describe_radio_options()
+
+
 @app.post("/api/coverage/single", response_model=CoverageResponse)
 async def calculate_single_site_coverage(request: SingleSiteRequest):
     """
@@ -319,6 +368,9 @@ async def calculate_single_site_coverage(request: SingleSiteRequest):
     Returns immediately with 'processing' status.
     Calculation runs in background.
     """
+    # Derive per-SF sensitivity from the chipset before anything else uses
+    # rx_sensitivity_dbm (cache key, SPLAT! config, stored metadata)
+    _apply_lora_link_budget(request)
     try:
         # Generate unique coverage ID
         coverage_id = str(uuid.uuid4())
@@ -362,6 +414,16 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
                                request.climate_zone, request.ground_type,
                                request.fraction_of_time)
         
+        # Radio metadata attached to results (both cache and fresh paths) so
+        # the UI/exports can show which link budget produced the map. Cached
+        # blobs may predate these fields, so they are (re)stamped here.
+        radio_meta = {
+            'rx_sensitivity_dbm': request.rx_sensitivity_dbm,
+            'radio_chipset': request.radio_chipset,
+            'spreading_factor': request.spreading_factor,
+            'bandwidth_khz': request.bandwidth_khz,
+        }
+        
         # Check if we have cached coverage for this exact site.
         # Run in a worker thread: deserializing large pickled coverage
         # blobs from SQLite would otherwise stall the event loop.
@@ -369,6 +431,7 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
         
         if cached_coverage:
             print(f"Using cached coverage for {site_key}")
+            cached_coverage.update(radio_meta)
             coverage_storage[coverage_id].update({
                 'status': 'complete',
                 'coverage_data': cached_coverage,
@@ -439,6 +502,7 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
         )
         
         # Update storage with results
+        coverage_data.update(radio_meta)
         coverage_storage[coverage_id].update({
             'status': 'complete',
             'coverage_data': coverage_data,
@@ -459,6 +523,7 @@ async def _calculate_coverage_background(coverage_id: str, request: SingleSiteRe
 @app.post("/api/coverage/multi", response_model=CoverageResponse)
 async def calculate_multi_site_coverage(request: MultiSiteRequest):
     """Calculate coverage for multiple sites."""
+    _apply_lora_link_budget(request)
     try:
         # Generate unique coverage ID
         coverage_id = str(uuid.uuid4())
@@ -497,7 +562,14 @@ async def calculate_multi_site_coverage(request: MultiSiteRequest):
             show_nodes=request.show_nodes
         )
         
-        # Store coverage data
+        # Store coverage data (stamped with the same radio metadata as the
+        # single-site path so the UI/exports can report the link budget)
+        coverage_data.update({
+            'rx_sensitivity_dbm': request.rx_sensitivity_dbm,
+            'radio_chipset': request.radio_chipset,
+            'spreading_factor': request.spreading_factor,
+            'bandwidth_khz': request.bandwidth_khz,
+        })
         coverage_storage[coverage_id] = {
             'status': 'complete',
             'coverage_data': coverage_data,
@@ -580,6 +652,10 @@ async def get_coverage_data(coverage_id: str):
         'antenna_azimuth': coverage_data.get('antenna_azimuth'),
         'antenna_tilt': coverage_data.get('antenna_tilt'),
         'antenna_tilt_azimuth': coverage_data.get('antenna_tilt_azimuth'),
+        'rx_sensitivity_dbm': coverage_data.get('rx_sensitivity_dbm'),
+        'radio_chipset': coverage_data.get('radio_chipset'),
+        'spreading_factor': coverage_data.get('spreading_factor'),
+        'bandwidth_khz': coverage_data.get('bandwidth_khz'),
         'site_name': coverage_data.get('site_name'),
         'dem_bounds': coverage_data.get('dem_bounds'),
         'dem_transform': coverage_data.get('dem_transform'),

@@ -107,6 +107,38 @@ def test_coverage_calculation():
     
     print("✓ Coverage calculation test passed\n")
 
+def test_lora_sensitivity_lookup():
+    """Test the per-SF/chipset LoRa sensitivity resolver."""
+    import pytest
+    from src.lora_link_budget import resolve_sensitivity
+
+    # Datasheet anchor points at 125 kHz
+    assert resolve_sensitivity('sx1262', 7, 125.0) == -124.0
+    assert resolve_sensitivity('sx1262', 12, 125.0) == -137.0
+    assert resolve_sensitivity('sx1276', 12, 125.0) == -136.0
+
+    # Bandwidth scaling: doubling BW costs ~3 dB, halving gains ~3 dB.
+    # SF11/250 (Meshtastic LongFast on SX1262) and SF7/62.5 (MeshCore US).
+    assert resolve_sensitivity('sx1262', 11, 250.0) == -132.5
+    assert resolve_sensitivity('sx1262', 7, 62.5) == -127.0
+
+    # LLCC68 restrictions: -129 dBm floor, limited SF per BW, no 62.5 kHz
+    assert resolve_sensitivity('llcc68', 9, 125.0) == -129.0
+    with pytest.raises(ValueError):
+        resolve_sensitivity('llcc68', 10, 125.0)   # SF10 needs >= 250 kHz
+    with pytest.raises(ValueError):
+        resolve_sensitivity('llcc68', 7, 62.5)     # BW unsupported
+
+    # Input validation
+    with pytest.raises(ValueError):
+        resolve_sensitivity('nrf905', 7, 125.0)    # unknown chipset
+    with pytest.raises(ValueError):
+        resolve_sensitivity('sx1262', 6, 125.0)    # SF out of range
+    with pytest.raises(ValueError):
+        resolve_sensitivity('sx1262', 7, 100.0)    # invalid bandwidth
+
+    print("✓ LoRa sensitivity lookup test passed\n")
+
 def test_configuration():
     """Test configuration loading."""
     print("Testing configuration...")

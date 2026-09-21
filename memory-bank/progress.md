@@ -43,8 +43,16 @@
    aiofiles import; pruned requirements.txt; fixed 2 stale tests
 6. `862e752` Ported KMZ/GeoTIFF import feature (endpoint, import_kmz with
    vectorized reverse color mapping, import_geotiff, frontend UI)
-7. Smoke test + from_cache serialization fix (GET /api/coverage/{id} and
-   /status now report whether a result came from the SQLite cache)
+7. `260452f` Smoke test + from_cache serialization fix (GET /api/coverage/{id}
+   and /status now report whether a result came from the SQLite cache)
+8. `23877d0` Per-SF LoRa link budget: src/lora_link_budget.py holds datasheet
+   sensitivity tables (SX1262/SX1268, SX1276/RFM95, LLCC68 with its floor and
+   SF/BW limits) at 125 kHz, scaled by 10*log10(bw/125). API fields
+   radio_chipset/spreading_factor/bandwidth_khz derive rx_sensitivity_dbm
+   server-side (fail-fast 422 on invalid combos). GET /api/lora/radios feeds
+   the UI (preset picker: MeshCore US current 910.525/62.5/SF7, legacy
+   250/SF11, Meshtastic presets). Motivated by field reports that coverage
+   maps don't match reality — fixed -110 sensitivity threw away up to 27 dB.
 
 ## What's left / known issues
 - Multi-site path: pure-Python engine only, no antenna patterns, no
