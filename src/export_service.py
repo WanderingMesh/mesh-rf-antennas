@@ -42,15 +42,29 @@ SIGNAL_COLORS = [
 ]
 
 
-def _build_coverage_png(coverage_mask, signal_strength) -> bytes:
+def _colorize_coverage(coverage_mask, signal_strength, alpha: int = 255) -> np.ndarray:
     """
-    Render coverage data as a transparent PNG for embedding in KMZ.
-    Non-coverage areas are fully transparent; coverage areas are colored
-    by signal strength using the SPLAT! color scale.
+    Map coverage data to an (H, W, 4) RGBA uint8 array using SIGNAL_COLORS.
+
+    Shared by the KMZ PNG overlay and the RGBA GeoTIFF export so both
+    products colorize identically — which also lets one reverse-mapping
+    routine (_rgba_to_coverage) decode either format on import.
 
     Fully vectorized: np.searchsorted maps every pixel to its color band
     at once instead of looping per pixel, which matters for the large
     rasters SPLAT! produces.
+
+    Args:
+        coverage_mask: 2D boolean array-like; True where coverage exists
+        signal_strength: 2D array-like of dBm values
+        alpha: Opacity (0-255) applied to covered pixels. The KMZ overlay
+            uses 180 so Google Earth imagery shows through; the GeoTIFF
+            uses 255 because it is often viewed standalone (GIS tools can
+            lower layer opacity themselves).
+
+    Returns:
+        (height, width, 4) uint8 RGBA array; uncovered pixels are fully
+        transparent with zeroed RGB.
     """
     mask = np.asarray(coverage_mask, dtype=bool)
     sig = np.asarray(signal_strength, dtype=np.float64)
@@ -70,14 +84,76 @@ def _build_coverage_png(coverage_mask, signal_strength) -> bytes:
 
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
     rgba[..., :3] = colors_desc[idx_desc]
-    rgba[..., 3] = np.where(mask, 180, 0)
-    # Zero out RGB where transparent to keep the PNG clean
+    rgba[..., 3] = np.where(mask, alpha, 0)
+    # Zero out RGB where transparent to keep the output clean
     rgba[~mask, :3] = 0
+    return rgba
+
+
+def _build_coverage_png(coverage_mask, signal_strength) -> bytes:
+    """
+    Render coverage data as a transparent PNG for embedding in KMZ.
+    Non-coverage areas are fully transparent; coverage areas are colored
+    by signal strength using the SPLAT! color scale at alpha 180 so the
+    underlying Google Earth imagery remains visible through the overlay.
+    """
+    rgba = _colorize_coverage(coverage_mask, signal_strength, alpha=180)
 
     img = Image.fromarray(rgba, 'RGBA')
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     return buf.getvalue()
+
+
+def _rgba_to_coverage(pixels: np.ndarray):
+    """
+    Reverse-map RGBA pixels back to (coverage_mask, signal_strength).
+
+    Inverse of _colorize_coverage: each visible pixel is matched to the
+    nearest SIGNAL_COLORS entry and assigned that band's threshold dBm.
+    Resolution is therefore limited to 10 dB bands — the stepped color
+    table cannot encode finer detail. Shared by the KMZ importer (PNG
+    overlay) and the GeoTIFF importer (RGBA raster) so both formats
+    decode identically.
+
+    Vectorized nearest-color matching over visible pixels only, chunked
+    to bound the size of the (N_pixels x N_colors) distance matrix —
+    same approach as the PPM parser in splat_service.py.
+
+    Args:
+        pixels: (height, width, 4) uint8 RGBA array
+
+    Returns:
+        Tuple of (coverage_mask bool ndarray, signal_strength float64
+        ndarray); pixels without coverage get -200.0 dBm.
+    """
+    height, width = pixels.shape[:2]
+
+    ref_colors = np.array([c for _, c in SIGNAL_COLORS], dtype=np.float32)
+    ref_dbm = np.array([d for d, _ in SIGNAL_COLORS], dtype=np.float64)
+
+    coverage_mask = np.zeros((height, width), dtype=bool)
+    signal_strength = np.full((height, width), -200.0)
+
+    # Alpha >= 50 counts as visible: KMZ overlays use 180, GeoTIFFs 255,
+    # and the low threshold tolerates files re-encoded with alpha loss.
+    vis_rows, vis_cols = np.nonzero(pixels[..., 3] >= 50)
+    CHUNK = 500_000
+    for start in range(0, vis_rows.size, CHUNK):
+        rows_c = vis_rows[start:start + CHUNK]
+        cols_c = vis_cols[start:start + CHUNK]
+        px = pixels[rows_c, cols_c, :3].astype(np.float32)
+
+        dists = ((px[:, None, :] - ref_colors[None, :, :]) ** 2).sum(axis=2)
+        best = np.argmin(dists, axis=1)
+        dbest = dists[np.arange(best.size), best]
+
+        # Only accept pixels close enough to a known signal color
+        ok = dbest < 15000
+        coverage_mask[rows_c[ok], cols_c[ok]] = True
+        signal_strength[rows_c[ok], cols_c[ok]] = ref_dbm[best[ok]]
+
+    return coverage_mask, signal_strength
 
 
 def _build_kml_xml(site_name: str, coverage_data: Dict, png_filename: str) -> str:
@@ -242,35 +318,11 @@ def import_kmz(kmz_bytes: bytes) -> Dict:
     tilt_az_match = re.search(r'toward\s+([\d.]+)', tilt_str)
     tilt_az = float(tilt_az_match.group(1)) if tilt_az_match else 0.0
 
-    # Reverse-map PNG pixels to signal strength. Vectorized nearest-color
-    # matching over visible pixels only, chunked to bound the size of the
-    # (N_pixels x N_colors) distance matrix — same approach as the PPM
-    # parser in splat_service.py.
+    # Reverse-map PNG overlay pixels to signal strength via the shared
+    # decoder (10 dB band resolution — see _rgba_to_coverage).
     img = Image.open(io.BytesIO(png_bytes)).convert('RGBA')
     pixels = np.array(img)
-    height, width = pixels.shape[:2]
-
-    ref_colors = np.array([c for _, c in SIGNAL_COLORS], dtype=np.float32)
-    ref_dbm = np.array([d for d, _ in SIGNAL_COLORS], dtype=np.float64)
-
-    coverage_mask = np.zeros((height, width), dtype=bool)
-    signal_strength = np.full((height, width), -200.0)
-
-    vis_rows, vis_cols = np.nonzero(pixels[..., 3] >= 50)
-    CHUNK = 500_000
-    for start in range(0, vis_rows.size, CHUNK):
-        rows_c = vis_rows[start:start + CHUNK]
-        cols_c = vis_cols[start:start + CHUNK]
-        px = pixels[rows_c, cols_c, :3].astype(np.float32)
-
-        dists = ((px[:, None, :] - ref_colors[None, :, :]) ** 2).sum(axis=2)
-        best = np.argmin(dists, axis=1)
-        dbest = dists[np.arange(best.size), best]
-
-        # Only accept pixels close enough to a known signal color
-        ok = dbest < 15000
-        coverage_mask[rows_c[ok], cols_c[ok]] = True
-        signal_strength[rows_c[ok], cols_c[ok]] = ref_dbm[best[ok]]
+    coverage_mask, signal_strength = _rgba_to_coverage(pixels)
 
     return {
         'coverage_mask': coverage_mask.tolist(),
@@ -294,8 +346,13 @@ def import_geotiff(tiff_bytes: bytes) -> Dict:
     """
     Import a previously-exported GeoTIFF back into coverage data.
 
-    This is lossless — the GeoTIFF stores raw dBm values in band 1
-    and embeds site metadata as raster tags.
+    Handles both export generations, detected by band layout:
+    - RGBA uint8 (current format): colors are reverse-mapped through
+      SIGNAL_COLORS, recovering dBm at 10 dB band resolution — the same
+      fidelity as a KMZ round trip.
+    - Single-band float32 (legacy format): raw dBm in band 1 with -9999
+      nodata; lossless. Kept so files exported before the colorized
+      format still load.
 
     Args:
         tiff_bytes: Raw bytes of the GeoTIFF file
@@ -307,13 +364,31 @@ def import_geotiff(tiff_bytes: bytes) -> Dict:
 
     with MemoryFile(tiff_bytes) as memfile:
         with memfile.open() as src:
-            raster = src.read(1)
-            nodata = src.nodata if src.nodata is not None else -9999.0
             bounds = src.bounds  # BoundingBox(left, bottom, right, top)
             tags = src.tags()
 
-    coverage_mask = (raster != nodata).tolist()
-    signal_strength = np.where(raster != nodata, raster, -200.0).astype(float).tolist()
+            if src.count >= 3 and src.dtypes[0] == 'uint8':
+                # Current format: colorized RGB(A) raster. Read band-major
+                # (bands, rows, cols) and convert to the pixel-major layout
+                # the shared decoder expects.
+                pixels = np.moveaxis(src.read(), 0, -1)
+                if pixels.shape[2] == 3:
+                    # Plain RGB (e.g. re-saved by an editor that dropped
+                    # alpha): treat every pixel as visible; the decoder's
+                    # nearest-color distance check still rejects pixels
+                    # that aren't coverage colors.
+                    opaque = np.full(pixels.shape[:2] + (1,), 255, dtype=np.uint8)
+                    pixels = np.concatenate([pixels, opaque], axis=2)
+                mask_arr, sig_arr = _rgba_to_coverage(pixels[..., :4])
+            else:
+                # Legacy format: band 1 holds raw float dBm, nodata -9999.
+                raster = src.read(1)
+                nodata = src.nodata if src.nodata is not None else -9999.0
+                mask_arr = raster != nodata
+                sig_arr = np.where(mask_arr, raster, -200.0).astype(float)
+
+    coverage_mask = mask_arr.tolist()
+    signal_strength = sig_arr.tolist()
 
     return {
         'coverage_mask': coverage_mask,
@@ -335,11 +410,20 @@ def import_geotiff(tiff_bytes: bytes) -> Dict:
 
 def export_geotiff(coverage_data: Dict, site_name: str = 'Coverage') -> bytes:
     """
-    Export coverage data as a georeferenced GeoTIFF with signal strength in dBm.
+    Export coverage data as a georeferenced, colorized RGBA GeoTIFF.
 
-    The raster band contains signal strength values (dBm) where coverage exists,
-    and a nodata value of -9999 where there is no coverage. This preserves the
-    full quantitative data for analysis in GIS tools.
+    Why RGBA colors instead of raw dBm values: the previous export wrote a
+    single-band float32 raster (dBm, nodata -9999). That is a correct
+    analysis product for GIS software, but ordinary image viewers (macOS
+    Preview, browsers, etc.) normalize the full pixel range *including* the
+    -9999 nodata fill, which crushes all real data to near-black — the files
+    looked broken even though the data was valid. Baking the SPLAT! color
+    scale into the raster makes the file display correctly everywhere while
+    staying georeferenced for QGIS/ArcGIS.
+
+    The tradeoff: per-pixel fidelity drops from continuous dBm to the 10 dB
+    bands of SIGNAL_COLORS. Re-import (import_geotiff) reverse-maps colors
+    back to band-floor dBm values, the same resolution as a KMZ round trip.
 
     Args:
         coverage_data: Dict with coverage_mask, signal_strength, dem_bounds, and metadata
@@ -360,8 +444,11 @@ def export_geotiff(coverage_data: Dict, site_name: str = 'Coverage') -> bytes:
     west, south, east, north = bounds
     height, width = signal_strength.shape
 
-    nodata = -9999.0
-    raster = np.where(coverage_mask, signal_strength, nodata).astype(np.float32)
+    # Opaque (alpha 255) covered pixels: unlike the KMZ overlay, which
+    # blends over satellite imagery at alpha 180, the TIFF is frequently
+    # opened on its own, where full-strength colors read best. Uncovered
+    # pixels stay alpha 0 so GIS tools composite cleanly over basemaps.
+    rgba = _colorize_coverage(coverage_mask, signal_strength, alpha=255)
 
     transform = from_bounds(west, south, east, north, width, height)
 
@@ -372,21 +459,31 @@ def export_geotiff(coverage_data: Dict, site_name: str = 'Coverage') -> bytes:
         driver='GTiff',
         height=height,
         width=width,
-        count=1,
-        dtype='float32',
+        count=4,
+        dtype='uint8',
         crs='EPSG:4326',
         transform=transform,
-        nodata=nodata,
         compress='deflate',
+        photometric='RGB',
+        # ALPHA=YES makes GDAL write the TIFF ExtraSamples tag marking
+        # band 4 as alpha — without it the 4th channel is "undefined" and
+        # viewers would not treat it as transparency. (Assigning
+        # dst.colorinterp after opening does NOT persist for GTiff, so the
+        # creation option is the reliable mechanism.)
+        alpha='yes',
     ) as dst:
-        dst.write(raster, 1)
+        # rasterio expects band-major (bands, rows, cols); _colorize_coverage
+        # returns pixel-major (rows, cols, bands), so move the band axis.
+        dst.write(np.moveaxis(rgba, -1, 0))
+        # Site metadata rides along as raster tags so import_geotiff can
+        # restore it (bounds come from the georeferencing itself).
         dst.update_tags(
             SITE_NAME=site_name,
             FREQUENCY_MHZ=str(coverage_data.get('frequency_mhz', '')),
             TX_POWER_DBM=str(coverage_data.get('tx_power_dbm', '')),
             ANTENNA_GAIN_DBI=str(coverage_data.get('antenna_gain_dbi', '')),
             ANTENNA_TYPE=str(coverage_data.get('antenna_type', '')),
-            BAND_UNITS='dBm',
+            COLOR_SCALE='SPLAT dBm bands, 10 dB steps (see SIGNAL_COLORS)',
         )
 
     return buf.getvalue()

@@ -23,9 +23,15 @@ Steps:
                         shape, coverage stats, and metadata echo
  5. Export              GET  /api/coverage/{id}/export/kmz and
                         GET  /api/coverage/{id}/export/geotiff
- 6. Re-import both      POST /api/coverage/import   — verify the KMZ
-                        round-trip recovers bounds/metadata/coverage and
-                        the GeoTIFF round-trip is lossless on dBm values
+ 6. Re-import both      POST /api/coverage/import   — verify both
+                        round-trips recover bounds/metadata/coverage.
+                        Both formats store the stepped SPLAT! color
+                        scale, so recovered dBm values are quantized to
+                        10 dB bands (band floors) rather than lossless.
+ 6b. Terrain view       GET  /api/coverage/{id}/hillshade — must return a
+                        PNG rendered from the local DEM cache; and
+                        GET  /api/peaks — must return a JSON peak list
+                        (empty tolerated: Overpass may be unreachable)
  7. Cache hit           POST the identical request again — must complete
                         near-instantly with from_cache=True
 
@@ -171,11 +177,51 @@ def main() -> int:
     if imp2:
         sig2 = np.array(imp2['signal_strength'])
         mask2 = np.array(imp2['coverage_mask'])
-        # GeoTIFF stores raw float dBm, so the round trip must be lossless
-        # (within float32 storage precision) on every covered pixel.
-        lossless = (mask2.shape == mask.shape and bool((mask2 == mask).all())
-                    and bool(np.allclose(sig2[mask2], sig[mask], atol=1e-3)))
-        check('GeoTIFF round-trip lossless', lossless)
+        # The GeoTIFF now stores the stepped SPLAT! color scale (so the
+        # file displays correctly in ordinary image viewers), which makes
+        # the round trip banded like KMZ: the coverage footprint must
+        # survive intact and every recovered value must be the 10 dB band
+        # floor of the original (0 <= original - imported < 10 dB).
+        footprint_ok = (mask2.shape == mask.shape and
+                        abs(int(mask2.sum()) - covered) / max(covered, 1) < 0.05)
+        check('GeoTIFF round-trip footprint', footprint_ok,
+              f"imported covered: {int(mask2.sum())} vs original {covered}")
+        if footprint_ok:
+            both = mask2 & mask
+            diffs = sig[both] - sig2[both]
+            banded = bool(both.any() and (diffs >= -1e-6).all()
+                          and (diffs < 10 + 1e-6).all())
+            check('GeoTIFF round-trip within 10 dB bands', banded,
+                  f"diff range {diffs.min():.2f}..{diffs.max():.2f} dB"
+                  if both.any() else 'no overlapping pixels')
+        # Metadata rides in raster tags and must survive the round trip
+        # (bounds come from the georeferencing; TX location is not stored
+        # in a GeoTIFF, so it is not checked here).
+        check('GeoTIFF round-trip metadata',
+              imp2.get('site_name') == 'SmokeTest'
+              and imp2.get('frequency_mhz') == 905.0
+              and imp2.get('antenna_type') == 'yagi_5el')
+
+    # ---- 6b. Terrain view endpoints ------------------------------------------
+    # Hillshade must render from the DEM tile the calculation just cached;
+    # a PNG signature proves the full DEM-load -> shade -> encode path ran.
+    r = requests.get(f"{base}/api/coverage/{coverage_id}/hillshade", timeout=120)
+    check('hillshade endpoint',
+          r.status_code == 200 and r.content[:8] == b'\x89PNG\r\n\x1a\n',
+          f"HTTP {r.status_code}, {len(r.content)} bytes")
+
+    # Peaks endpoint must answer with a JSON list. An EMPTY list passes:
+    # the Overpass API is an external service and its availability must
+    # not fail the smoke test — the endpoint contract is "never errors".
+    w, s, e, n = data['dem_bounds']
+    r = requests.get(f"{base}/api/peaks",
+                     params={'west': w, 'south': s, 'east': e, 'north': n},
+                     timeout=90)
+    peaks_body = r.json() if r.status_code == 200 else {}
+    check('peaks endpoint',
+          r.status_code == 200 and isinstance(peaks_body.get('peaks'), list),
+          f"HTTP {r.status_code}, {len(peaks_body.get('peaks', []))} peaks"
+          + (', cached' if peaks_body.get('cached') else ''))
 
     # ---- 7. Identical request again must be a cache hit ---------------------
     r = requests.post(f"{base}/api/coverage/single", json=site, timeout=30)
