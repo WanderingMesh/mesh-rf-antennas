@@ -610,3 +610,45 @@ body {
     color: white;
     border-color: var(--accent);
 }
+
+/* ===========================================================================
+   Terrain view: peak markers and labels
+   =========================================================================== */
+
+/* Small summit triangle; the white drop-shadow keeps it visible whether it
+   lands on dark hillshade, bright coverage colors, or satellite imagery. */
+.peak-triangle {
+    width: 0;
+    height: 0;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-bottom: 10px solid #5d4037;
+    filter: drop-shadow(0 0 1.5px rgba(255, 255, 255, 0.95));
+}
+
+/* Name + elevation label above the triangle. Deliberately NOT themed with
+   CSS variables: it sits on the map over arbitrary imagery, so a fixed
+   translucent light chip with dark text stays readable in both app themes
+   (the same convention map tile labels use). */
+.peak-label {
+    background: rgba(255, 255, 255, 0.85);
+    border: none;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+    border-radius: 3px;
+    color: #2d2d2d;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 5px;
+    white-space: nowrap;
+}
+
+/* Hide Leaflet's default tooltip arrow — visual noise at this label size */
+.peak-label::before {
+    display: none;
+}
+
+/* Dark theme: dim map tiles are already filtered darker; a slightly
+   translucent chip keeps labels from glowing too bright against them. */
+[data-theme="dark"] .peak-label {
+    background: rgba(240, 240, 240, 0.78);
+}

@@ -34,6 +34,22 @@ class CoverageApp {
 
         this.map = L.map('map').setView([39.5296, -119.8138], 10);
         
+        // Custom panes make the terrain-view stacking explicit. Leaflet's
+        // defaults put tiles at z=200 and imageOverlays (our coverage) in
+        // the overlayPane at z=400, so:
+        //   hillshadePane (350):  above base tiles, BELOW coverage — the
+        //                         terrain must not obscure the signal wash
+        //   referencePane (450):  roads/place-label tiles ABOVE coverage,
+        //                         otherwise labels drown under the overlay
+        //   peaksPane     (460):  peak markers above everything but tooltips
+        // pointer-events stays off so these decorative layers never
+        // swallow map clicks meant for site placement.
+        for (const [name, z] of [['hillshadePane', 350], ['referencePane', 450], ['peaksPane', 460]]) {
+            this.map.createPane(name);
+            this.map.getPane(name).style.zIndex = z;
+            this.map.getPane(name).style.pointerEvents = 'none';
+        }
+        
         // Add tile layers
         const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '© OpenStreetMap contributors',
@@ -60,7 +76,51 @@ class CoverageApp {
             "Terrain": terrainLayer
         };
         
-        L.control.layers(baseLayers).addTo(this.map);
+        // --- Terrain view overlays ---------------------------------------
+        // Roads and place names come from Esri's transparent reference tile
+        // services (same host we already use for satellite imagery). They
+        // live in referencePane, ABOVE the coverage overlay, so labels stay
+        // readable through the signal-strength wash.
+        const roadsLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', {
+            attribution: '© Esri',
+            maxZoom: 19,
+            pane: 'referencePane'
+        });
+        const labelsLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+            attribution: '© Esri',
+            maxZoom: 19,
+            pane: 'referencePane'
+        });
+        
+        // Hillshade and peaks are LayerGroups whose contents this app
+        // manages (per-coverage-layer underlays / per-viewport markers),
+        // but registering the groups in the layer control gives the user
+        // one familiar on/off switch for each.
+        this.hillshadeGroup = L.layerGroup();
+        this.peaksGroup = L.layerGroup();
+        
+        const overlays = {
+            "Terrain (model DEM)": this.hillshadeGroup,
+            "Roads": roadsLayer,
+            "Place labels": labelsLayer,
+            "Peaks": this.peaksGroup
+        };
+        
+        L.control.layers(baseLayers, overlays).addTo(this.map);
+        
+        // Populate group contents lazily, only when the user turns a group
+        // on — no hillshade requests or Overpass queries for features that
+        // are never used.
+        this.map.on('overlayadd', (e) => {
+            if (e.layer === this.hillshadeGroup) this.refreshHillshades();
+            if (e.layer === this.peaksGroup) this.refreshPeaks();
+        });
+        
+        // Keep peaks in sync with the viewport while the layer is active.
+        // Debounced so panning doesn't fire a request per animation frame.
+        this.map.on('moveend', () => {
+            if (this.map.hasLayer(this.peaksGroup)) this.schedulePeaksRefresh();
+        });
         
         // Signal-strength legend (bottom-right corner of the map).
         // The legend updates dynamically when coverage is rendered
@@ -968,6 +1028,7 @@ class CoverageApp {
             layer: imageOverlay,
             siteName: coverageData.site_name || 'Unknown Site',
             coverageId: coverageId,
+            demBounds: demBounds,  // kept for the terrain-view hillshade underlay
             color: null,  // signal-strength heat map, no single site color
             visible: true
         };
@@ -977,6 +1038,10 @@ class CoverageApp {
         // Update layer control panel and signal legend
         this.updateLayerControl();
         this.updateSignalLegend();
+        
+        // If the terrain view is active, give the new layer its hillshade
+        // underlay immediately rather than waiting for a toggle.
+        this.refreshHillshades();
         
         // Fit map to coverage bounds
         this.map.fitBounds(bounds, { padding: [50, 50] });
@@ -1126,6 +1191,9 @@ class CoverageApp {
     clearCoverageLayers() {
         this.coverageLayers.forEach(layerInfo => this.map.removeLayer(layerInfo.layer));
         this.nodeMarkers.forEach(marker => this.map.removeLayer(marker));
+        // Hillshades belong to coverage layers, so they go too. Peaks are
+        // viewport-scoped (not coverage-scoped) and survive a map clear.
+        if (this.hillshadeGroup) this.hillshadeGroup.clearLayers();
         this.coverageLayers = [];
         this.nodeMarkers = [];
         this.currentColorIndex = 0;
@@ -1170,7 +1238,7 @@ class CoverageApp {
             const exportButtons = layerInfo.coverageId ? `
                 <div style="display: flex; gap: 4px; margin-left: auto;">
                     <button class="export-btn" data-id="${layerInfo.coverageId}" data-format="kmz" title="Export as KMZ (Google Earth)">KMZ</button>
-                    <button class="export-btn" data-id="${layerInfo.coverageId}" data-format="geotiff" title="Export as GeoTIFF (GIS)">TIF</button>
+                    <button class="export-btn" data-id="${layerInfo.coverageId}" data-format="geotiff" title="Export as colorized GeoTIFF (image viewers and GIS)">TIF</button>
                 </div>
             ` : '';
             
@@ -1261,6 +1329,97 @@ class CoverageApp {
             if (this.map.hasLayer(layerInfo.layer)) {
                 this.map.removeLayer(layerInfo.layer);
             }
+        }
+        
+        // Keep each layer's hillshade underlay in lockstep with its
+        // coverage: hiding coverage but leaving its terrain would read as
+        // a bug ("why is there a gray rectangle here?").
+        this.refreshHillshades();
+    }
+    
+    // ------------------------------------------------------------------
+    // Terrain view: DEM hillshade underlays and peak-name markers
+    // ------------------------------------------------------------------
+    
+    refreshHillshades() {
+        // Rebuild the hillshade group to mirror the current, VISIBLE
+        // coverage layers. Rebuilding (rather than diffing) keeps this
+        // trivially correct; the backend caches rendered PNGs and the
+        // browser reuses in-flight images, so churn is cheap.
+        if (!this.hillshadeGroup) return;
+        this.hillshadeGroup.clearLayers();
+        
+        this.coverageLayers.forEach(layerInfo => {
+            // Layers without a server-side id (e.g. legacy in-page state)
+            // or without bounds can't have server-rendered terrain.
+            if (!layerInfo.coverageId || !layerInfo.demBounds || !layerInfo.visible) return;
+            
+            const b = layerInfo.demBounds;  // [west, south, east, north]
+            const overlay = L.imageOverlay(
+                `/api/coverage/${layerInfo.coverageId}/hillshade`,
+                [[b[1], b[0]], [b[3], b[2]]],   // [[S,W],[N,E]]
+                { opacity: 1.0, interactive: false, pane: 'hillshadePane' }
+            );
+            this.hillshadeGroup.addLayer(overlay);
+        });
+    }
+    
+    schedulePeaksRefresh() {
+        // Debounce viewport-driven refreshes: fire once the map settles,
+        // not on every intermediate move event during a pan/zoom.
+        clearTimeout(this._peaksTimer);
+        this._peaksTimer = setTimeout(() => this.refreshPeaks(), 600);
+    }
+    
+    async refreshPeaks() {
+        if (!this.peaksGroup || !this.map.hasLayer(this.peaksGroup)) return;
+        
+        const b = this.map.getBounds();
+        const params = new URLSearchParams({
+            west: b.getWest().toFixed(4),
+            south: b.getSouth().toFixed(4),
+            east: b.getEast().toFixed(4),
+            north: b.getNorth().toFixed(4)
+        });
+        
+        try {
+            const response = await fetch(`/api/peaks?${params}`);
+            if (!response.ok) {
+                // Oversized bbox (zoomed way out) or server error — just
+                // clear the markers; peaks return when the user zooms in.
+                this.peaksGroup.clearLayers();
+                return;
+            }
+            const data = await response.json();
+            if (data.warning) console.warn('Peaks layer:', data.warning);
+            
+            this.peaksGroup.clearLayers();
+            (data.peaks || []).forEach(peak => {
+                const marker = L.marker([peak.lat, peak.lon], {
+                    pane: 'peaksPane',
+                    interactive: false,
+                    icon: L.divIcon({
+                        className: 'peak-marker',
+                        html: '<div class="peak-triangle"></div>',
+                        iconSize: [12, 10],
+                        iconAnchor: [6, 10]   // triangle tip sits on the summit
+                    })
+                });
+                // Elevation is optional in OSM data; show it when known
+                const ele = peak.elevation_m != null
+                    ? ` ${Math.round(peak.elevation_m).toLocaleString()} m` : '';
+                marker.bindTooltip(`${peak.name}${ele}`, {
+                    permanent: true,
+                    direction: 'top',
+                    offset: [0, -8],
+                    className: 'peak-label'
+                });
+                this.peaksGroup.addLayer(marker);
+            });
+        } catch (err) {
+            // Network failure: leave whatever markers exist; the next
+            // moveend will retry. Peaks are decoration, never an error.
+            console.warn('Peaks fetch failed:', err);
         }
     }
     

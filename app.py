@@ -24,6 +24,7 @@ API Endpoints:
 """
 
 import copy
+import io
 import os
 import sys
 import json
@@ -40,7 +41,7 @@ sys.path.append(str(Path(__file__).parent / "src"))
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, Depends, Header
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -703,7 +704,7 @@ async def export_coverage_kmz(coverage_id: str):
 
 @app.get("/api/coverage/{coverage_id}/export/geotiff")
 async def export_coverage_geotiff(coverage_id: str):
-    """Export coverage layer as a GeoTIFF with signal strength in dBm."""
+    """Export coverage layer as a colorized RGBA GeoTIFF (georeferenced, viewable anywhere)."""
     if coverage_id not in coverage_storage:
         raise HTTPException(status_code=404, detail="Coverage data not found")
     
@@ -721,6 +722,276 @@ async def export_coverage_geotiff(coverage_id: str):
     
     safe_name = site_name.replace(' ', '_').replace('/', '_')
     return _binary_response(tiff_bytes, f'{safe_name}_coverage.tif', 'image/tiff')
+
+
+# ============================================================================
+# TERRAIN VIEW (hillshade + peaks)
+# ============================================================================
+
+# Rendered hillshade PNGs cached in memory keyed by rounded bounds. Users
+# toggle the terrain overlay on and off repeatedly, and re-rendering means
+# a DEM load plus shading math over a ~2000x2000 grid; the PNGs are only a
+# few hundred KB each so a small FIFO is the right trade.
+hillshade_cache: Dict[tuple, bytes] = {}
+MAX_HILLSHADE_CACHE = 8
+
+
+def _load_dem_for_bounds(bounds):
+    """
+    Load DEM elevation data covering (west, south, east, north).
+
+    Tries three sources, cheapest first:
+    1. The exact cache file DEMHandler would use — always a hit for layers
+       calculated on this install, because the coverage calculation already
+       wrote that tile.
+    2. Any cached DEM tile that fully CONTAINS the bounds, cropped to the
+       requested window. Imported layers rarely match a cache filename
+       textually, and without this fallback merely toggling the terrain
+       view would trigger a multi-minute SRTM download.
+    3. DEMHandler.get_dem_data, which downloads from SRTM — same path the
+       coverage calculator takes for brand-new areas.
+
+    Returns:
+        Tuple of (elevation ndarray, affine transform)
+    """
+    import rasterio
+    from rasterio.windows import from_bounds as window_from_bounds
+    from src.dem_handler import DEMHandler
+
+    west, south, east, north = bounds
+    # The global config nests DEM settings under a 'dem' section; fall back
+    # to the flat dict shape so this also works with test/legacy configs.
+    dem_cfg = config.get('dem', config)
+    cache_dir = Path(dem_cfg.get('dem_cache_dir', 'dem_cache'))
+    resolution = dem_cfg.get('dem_resolution', 90)
+    handler = DEMHandler(cache_dir=str(cache_dir), resolution=resolution)
+
+    # 1. Exact tile (filename format must match DEMHandler.get_dem_data)
+    exact = cache_dir.absolute() / f"dem_{west:.4f}_{south:.4f}_{east:.4f}_{north:.4f}_{resolution}m.tif"
+    if exact.exists():
+        return handler.get_dem_data(bounds)
+
+    # 2. Crop from any cached tile that contains the requested bounds
+    for tif in sorted(cache_dir.glob('dem_*.tif')):
+        try:
+            with rasterio.open(tif) as src:
+                b = src.bounds
+                if (b.left <= west and b.bottom <= south and
+                        b.right >= east and b.top >= north):
+                    window = window_from_bounds(west, south, east, north, src.transform)
+                    return src.read(1, window=window), src.window_transform(window)
+        except Exception:
+            # Unreadable/partial tile — keep scanning, worst case we download
+            continue
+
+    # 3. Nothing cached covers these bounds: download
+    return handler.get_dem_data(bounds)
+
+
+def _render_hillshade_png(bounds) -> bytes:
+    """
+    Render a grayscale hillshade PNG of the terrain within bounds.
+
+    Uses matplotlib's LightSource (matplotlib is already a dependency) with
+    standard cartographic lighting — azimuth 315° (northwest), altitude 45° —
+    the same convention as USGS/OpenTopoMap shading, so the relief reads
+    naturally to anyone used to topo maps.
+    """
+    dem, transform = _load_dem_for_bounds(bounds)
+    dem = dem.astype(np.float64)
+
+    # SRTM voids are large negative sentinels (e.g. -32768). Replace them
+    # with the median elevation: shading stays finite and voids blend into
+    # the surroundings instead of appearing as artificial cliffs.
+    voids = dem < -1000
+    if voids.any():
+        dem[voids] = np.median(dem[~voids]) if (~voids).any() else 0.0
+
+    # Pixel spacing in meters, not degrees: the transform is geographic, so
+    # without this conversion the E-W slope would be exaggerated ~1.3x at
+    # Nevada latitudes and the lighting would look skewed.
+    center_lat = (bounds[1] + bounds[3]) / 2.0
+    meters_per_deg_lat = 111_320.0
+    meters_per_deg_lon = meters_per_deg_lat * np.cos(np.radians(center_lat))
+    dx = abs(transform.a) * meters_per_deg_lon
+    dy = abs(transform.e) * meters_per_deg_lat
+
+    # Mild vertical exaggeration keeps low-relief basins from flattening
+    # into featureless gray while ridgelines stay crisp.
+    ls = mcolors.LightSource(azdeg=315, altdeg=45)
+    shaded = ls.hillshade(dem, vert_exag=1.5, dx=dx, dy=dy)  # floats in 0..1
+
+    img = Image.fromarray((shaded * 255).astype(np.uint8), mode='L')
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+
+@app.get("/api/coverage/{coverage_id}/hillshade")
+async def get_coverage_hillshade(coverage_id: str):
+    """
+    Grayscale hillshade PNG of the DEM terrain for this layer's bounds.
+
+    Backs the frontend Terrain view: drawn underneath the coverage overlay,
+    it shows the EXACT terrain the propagation model used (not third-party
+    map tiles), so RF shadows visibly align with the ridges that cause them.
+    """
+    if coverage_id not in coverage_storage:
+        raise HTTPException(status_code=404, detail="Coverage data not found")
+
+    stored = coverage_storage[coverage_id]
+    if stored.get('status') != 'complete':
+        raise HTTPException(status_code=400, detail="Coverage calculation not complete")
+
+    bounds = stored['coverage_data'].get('dem_bounds')
+    if not bounds:
+        raise HTTPException(status_code=400, detail="Coverage layer has no DEM bounds")
+
+    key = tuple(round(float(v), 6) for v in bounds)
+    if key not in hillshade_cache:
+        try:
+            # to_thread keeps the event loop responsive during DEM I/O and
+            # shading math, matching how coverage calculation is offloaded.
+            png = await asyncio.to_thread(_render_hillshade_png, bounds)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Hillshade rendering failed: {e}")
+        if len(hillshade_cache) >= MAX_HILLSHADE_CACHE:
+            # FIFO eviction: dicts preserve insertion order
+            hillshade_cache.pop(next(iter(hillshade_cache)))
+        hillshade_cache[key] = png
+
+    return Response(content=hillshade_cache[key], media_type='image/png')
+
+
+# Named-summit lookups cached as JSON files so the peaks layer works offline
+# after the first fetch (mirrors the dem_cache approach of keying files by
+# bounds). Directory name follows the *_cache convention of the project.
+PEAKS_CACHE_DIR = Path('peaks_cache')
+
+
+# Official Overpass instances, tried in order. The primary URL routinely
+# returns transient 504s under load (observed during development); lz4 is
+# an official load-balanced sibling of the same service, so falling back
+# to it converts most of those hiccups into successes.
+OVERPASS_ENDPOINTS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://lz4.overpass-api.de/api/interpreter',
+]
+
+
+def _fetch_peaks_from_overpass(west: float, south: float, east: float, north: float) -> List[Dict]:
+    """
+    Query the OSM Overpass API for named peaks in a bounding box.
+
+    Uses stdlib urllib rather than adding a 'requests' dependency for one
+    call. Returns a list of {name, lat, lon, elevation_m} dicts sorted
+    highest-first (elevation-unknown peaks last), because when the frontend
+    caps the count, the prominent summits are the ones worth keeping.
+    """
+    import urllib.parse
+    import urllib.request
+
+    # Only named peaks: unnamed bumps are useless for orientation.
+    query = (
+        '[out:json][timeout:25];'
+        f'node["natural"="peak"]["name"]({south},{west},{north},{east});'
+        'out body;'
+    )
+    payload = None
+    last_error = None
+    for endpoint in OVERPASS_ENDPOINTS:
+        req = urllib.request.Request(
+            endpoint,
+            data=urllib.parse.urlencode({'data': query}).encode('utf-8'),
+            headers={'User-Agent': 'mesh-rf-antennas/1.0 (terrain view)'},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode('utf-8'))
+            break
+        except Exception as e:  # noqa: BLE001 — any endpoint failure means "try the next"
+            last_error = e
+    if payload is None:
+        raise last_error
+
+    peaks = []
+    for el in payload.get('elements', []):
+        tags = el.get('tags', {})
+        name = tags.get('name')
+        if not name or 'lat' not in el or 'lon' not in el:
+            continue
+        # The 'ele' tag is free text; tolerate values like "2999", "2999 m"
+        elevation = None
+        raw_ele = tags.get('ele')
+        if raw_ele is not None:
+            try:
+                elevation = float(str(raw_ele).lower().replace('m', '').strip())
+            except ValueError:
+                pass
+        peaks.append({
+            'name': name,
+            'lat': float(el['lat']),
+            'lon': float(el['lon']),
+            'elevation_m': elevation,
+        })
+
+    peaks.sort(key=lambda p: (p['elevation_m'] is None, -(p['elevation_m'] or 0.0)))
+    return peaks
+
+
+@app.get("/api/peaks")
+async def get_peaks(west: float, south: float, east: float, north: float, limit: int = 50):
+    """
+    Named summits within a bounding box, for the map's Peaks overlay.
+
+    The requested bounds are snapped OUTWARD to a 0.1 degree grid before
+    querying/caching. Two reasons: small pans reuse the same cache entry
+    instead of re-querying Overpass for near-identical boxes, and peaks
+    just beyond the viewport edge don't pop in and out while panning.
+
+    Overpass failures return an empty list with a warning instead of an
+    error — orientation labels are decoration, not core function.
+    """
+    if not (west < east and south < north):
+        raise HTTPException(status_code=400, detail="Invalid bounds")
+    # Refuse continent-sized queries: Overpass would time out or return
+    # tens of thousands of nodes. 5 degrees comfortably covers the largest
+    # coverage bbox this app produces (200 km radius ≈ 3.6°).
+    if (east - west) > 5.0 or (north - south) > 5.0:
+        raise HTTPException(status_code=400, detail="Bounding box too large (max 5 degrees per side)")
+
+    limit = max(1, min(int(limit), 200))
+
+    import math
+    snap = 0.1
+    west_s = math.floor(west / snap) * snap
+    south_s = math.floor(south / snap) * snap
+    east_s = math.ceil(east / snap) * snap
+    north_s = math.ceil(north / snap) * snap
+
+    PEAKS_CACHE_DIR.mkdir(exist_ok=True)
+    cache_file = PEAKS_CACHE_DIR / f"peaks_{west_s:.1f}_{south_s:.1f}_{east_s:.1f}_{north_s:.1f}.json"
+
+    if cache_file.exists():
+        try:
+            peaks = json.loads(cache_file.read_text())
+            return {'peaks': peaks[:limit], 'cached': True}
+        except (json.JSONDecodeError, OSError):
+            pass  # corrupt cache file: fall through to re-fetch
+
+    try:
+        peaks = await asyncio.to_thread(
+            _fetch_peaks_from_overpass, west_s, south_s, east_s, north_s)
+    except Exception as e:
+        return {'peaks': [], 'cached': False,
+                'warning': f'Peak lookup unavailable: {e}'}
+
+    try:
+        cache_file.write_text(json.dumps(peaks))
+    except OSError:
+        pass  # cache write failure is non-fatal; the response still works
+
+    return {'peaks': peaks[:limit], 'cached': False}
 
 
 @app.post("/api/coverage/import")

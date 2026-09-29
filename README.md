@@ -31,7 +31,7 @@ A web application for RF coverage mapping powered by [SPLAT!](https://www.qsl.ne
 - **Directional Antenna Support** — Omnidirectional and Yagi antenna patterns (3, 5, and 11-element) with user-specified azimuth, mechanical tilt, and tilt direction. SPLAT!'s `LoadPAT` rotation is used for accurate pattern application.
 - **Signal-Strength Heat Map** — Continuous color gradient from red (strongest) to purple (weakest), auto-scaled to the 2nd–98th percentile of actual signal data so directional patterns are clearly visible.
 - **Interactive Leaflet Map** — Click to place a transmitter, adjust RF parameters, and see coverage rendered as a geo-referenced image overlay. Multiple simultaneous layers with toggle visibility.
-- **KMZ and GeoTIFF Export** — Download any coverage layer for use in Google Earth (KMZ) or GIS software (GeoTIFF with signal strength in dBm).
+- **KMZ and GeoTIFF Export** — Download any coverage layer for use in Google Earth (KMZ) or GIS software and image viewers (colorized, georeferenced GeoTIFF).
 - **Persistent Caching** — SQLite-backed cache keyed on all site and antenna parameters. Previously computed coverage loads instantly.
 - **Multi-Site Analysis** — Upload a CSV of site locations for batch coverage calculation.
 - **Real-Time Progress** — Background calculation with progress polling so the UI never freezes.
@@ -162,6 +162,15 @@ Each calculation creates a named layer in the **Coverage Layers** panel. Layers 
 - Exported as **KMZ** (Google Earth) or **TIF** (GeoTIFF)
 - Cleared individually or all at once
 
+### Terrain View
+
+The map's layer control (top-right) includes four overlays that turn the coverage map into a terrain-aware view:
+
+- **Terrain (model DEM)** — A hillshade rendered server-side from the *same SRTM elevation data the propagation model used*, drawn underneath the coverage. RF shadows line up exactly with the ridges that cause them — something third-party map tiles can't guarantee. Served by `GET /api/coverage/{id}/hillshade`, rendered from the local `dem_cache`, so it works offline for any previously analyzed area.
+- **Roads** — Transparent Esri road tiles drawn *above* the coverage so highways stay visible through the signal wash.
+- **Place labels** — Transparent Esri city/town/boundary labels, also above the coverage.
+- **Peaks** — Named summits with elevations (e.g. "Star Peak 2,999 m"), fetched from OpenStreetMap for the visible map area via `GET /api/peaks`, capped at the 50 highest to avoid clutter. Results are cached as JSON in `peaks_cache/`, so previously viewed areas work offline. If the OSM Overpass service is unreachable, the layer simply shows nothing — it never blocks coverage work.
+
 ---
 
 ## Directional Antennas
@@ -229,13 +238,16 @@ Click the **KMZ** button next to any coverage layer. The download contains:
 - KML file with geographic bounds and transmitter placemark
 - Packaged as a standard KMZ (zipped KML) file
 
-### GeoTIFF Export (GIS Software)
+### GeoTIFF Export (GIS Software and Image Viewers)
 
-Click the **TIF** button next to any coverage layer. The download is a georeferenced raster with:
-- Signal strength values in dBm per pixel
-- Nodata value of -9999
+Click the **TIF** button next to any coverage layer. The download is a georeferenced, colorized RGBA raster:
+- Signal strength rendered with the SPLAT! color scale (same colors as the map and KMZ), in 10 dB bands
+- Transparent (alpha 0) where there is no coverage
 - EPSG:4326 coordinate reference system
-- Compatible with QGIS, ArcGIS, GDAL, etc.
+- Displays correctly in ordinary image viewers (macOS Preview, browsers) *and* GIS tools (QGIS, ArcGIS, GDAL)
+- Site metadata (name, frequency, TX power, antenna gain/type) embedded as raster tags
+
+Note: earlier versions exported a single-band float32 raster of raw dBm values. Those files are a valid GIS analysis product but render as black in ordinary image viewers (the -9999 nodata fill dominates the value range). Re-importing recovers dBm at 10 dB color-band resolution for current files, and losslessly for legacy float32 files, which remain importable.
 
 ### API Endpoints for Export
 
@@ -325,6 +337,8 @@ User clicks "Calculate"
 | `GET` | `/api/coverage/{id}` | Retrieve coverage data |
 | `GET` | `/api/coverage/{id}/export/kmz` | Download KMZ file |
 | `GET` | `/api/coverage/{id}/export/geotiff` | Download GeoTIFF file |
+| `GET` | `/api/coverage/{id}/hillshade` | DEM hillshade PNG for the layer bounds (terrain view) |
+| `GET` | `/api/peaks?west=&south=&east=&north=` | Named summits in a bounding box (peaks overlay) |
 | `GET` | `/api/coverage/{id}/map` | Coverage map image (PNG) |
 | `GET` | `/api/config` | Current configuration |
 | `GET` | `/api/health` | Health check |
